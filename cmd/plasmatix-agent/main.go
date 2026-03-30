@@ -530,7 +530,7 @@ func (a *Agent) selfUpdate() error {
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
 
-	downloadURL := fmt.Sprintf("%s/releases/plasmatix-agent-%s-%s",
+	downloadURL := fmt.Sprintf("%s/api/releases/plasmatix-agent-%s-%s",
 		a.config.PlamatixURL, goos, goarch)
 
 	log.Printf("Downloading new binary from %s...", downloadURL)

@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -604,45 +605,33 @@ func (a *Agent) restartService() {
 }
 
 func (a *Agent) selfUninstall() {
-	// Give time for the response to be sent
-	time.Sleep(2 * time.Second)
-
-	serviceName := "plasmatix-agent"
-	binPath := "/usr/local/bin/plasmatix-agent"
-	confDir := "/etc/plasmatix"
-
-	// Stop and disable systemd service
-	run := func(name string, args ...string) {
-		cmd := exec.Command(name, args...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			log.Printf("uninstall: %s %v: %v", name, args, err)
-		}
+	// Write a detached cleanup script that runs after this process is killed.
+	// We can't do cleanup inline because `systemctl stop` sends SIGTERM to us.
+	script := `#!/bin/bash
+sleep 2
+systemctl stop plasmatix-agent 2>/dev/null
+systemctl disable plasmatix-agent 2>/dev/null
+rm -f /etc/systemd/system/plasmatix-agent.service
+systemctl daemon-reload 2>/dev/null
+rm -rf /etc/plasmatix
+rm -f /usr/local/bin/plasmatix-agent
+rm -f /tmp/plasmatix-uninstall.sh
+`
+	scriptPath := "/tmp/plasmatix-uninstall.sh"
+	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
+		log.Printf("uninstall: write script: %v", err)
+		return
 	}
 
-	log.Println("Stopping service...")
-	run("systemctl", "stop", serviceName)
-	run("systemctl", "disable", serviceName)
-
-	// Remove service file
-	serviceFile := fmt.Sprintf("/etc/systemd/system/%s.service", serviceName)
-	if err := os.Remove(serviceFile); err != nil && !os.IsNotExist(err) {
-		log.Printf("uninstall: remove %s: %v", serviceFile, err)
-	}
-	run("systemctl", "daemon-reload")
-
-	// Remove config directory
-	if err := os.RemoveAll(confDir); err != nil {
-		log.Printf("uninstall: remove %s: %v", confDir, err)
+	log.Println("Launching detached uninstall script...")
+	cmd := exec.Command("bash", scriptPath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		log.Printf("uninstall: start script: %v", err)
+		return
 	}
 
-	// Remove binary (self-delete)
-	if err := os.Remove(binPath); err != nil && !os.IsNotExist(err) {
-		log.Printf("uninstall: remove %s: %v", binPath, err)
-	}
-
-	log.Println("Uninstall complete — exiting")
+	log.Println("Uninstall script launched — exiting")
 	os.Exit(0)
 }
 

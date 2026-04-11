@@ -37,6 +37,8 @@ type Config struct {
 	ZKBioUsername  string
 	ZKBioPassword  string
 	Port          int
+	Mode          string
+	ADMSPort      int
 }
 
 type Agent struct {
@@ -180,13 +182,20 @@ func main() {
 	agent := &Agent{
 		config:    cfg,
 		startedAt: time.Now(),
-		sessions: &SessionManager{
+	}
+	if cfg.Mode == "zkbio" {
+		agent.sessions = &SessionManager{
 			config: cfg,
 			ttl:    sessionTTL,
-		},
+		}
 	}
 
-	log.Printf("plasmatix-agent %s starting", version)
+	log.Printf("plasmatix-agent %s starting (mode: %s)", version, cfg.Mode)
+
+	if cfg.Mode == "adms" {
+		go agent.startADMSServer()
+	}
+
 	agent.connectLoop()
 }
 
@@ -203,11 +212,22 @@ func loadConfig(path string) (Config, error) {
 		ZKBioUsername string `json:"zkbio_username"`
 		ZKBioPassword string `json:"zkbio_password"`
 		Port          int    `json:"port"`
+		Mode          string `json:"mode"`
+		ADMSPort      int    `json:"adms_port"`
 	}
 
 	var jc jsonConfig
 	if json.Unmarshal(raw, &jc) == nil && jc.APIKey != "" {
-		return normalizeConfig(Config(jc))
+		return normalizeConfig(Config{
+			APIKey:        jc.APIKey,
+			PlamatixURL:   jc.PlamatixURL,
+			ZKBioURL:      jc.ZKBioURL,
+			ZKBioUsername:  jc.ZKBioUsername,
+			ZKBioPassword:  jc.ZKBioPassword,
+			Port:          jc.Port,
+			Mode:          jc.Mode,
+			ADMSPort:      jc.ADMSPort,
+		})
 	}
 
 	parsed := map[string]string{}
@@ -237,6 +257,15 @@ func loadConfig(path string) (Config, error) {
 		port = parsedPort
 	}
 
+	admsPort := 0
+	if parsed["adms_port"] != "" {
+		parsedADMSPort, err := strconv.Atoi(parsed["adms_port"])
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid adms_port: %w", err)
+		}
+		admsPort = parsedADMSPort
+	}
+
 	return normalizeConfig(Config{
 		APIKey:        parsed["api_key"],
 		PlamatixURL:   parsed["plasmatix_url"],
@@ -244,6 +273,8 @@ func loadConfig(path string) (Config, error) {
 		ZKBioUsername: parsed["zkbio_username"],
 		ZKBioPassword: parsed["zkbio_password"],
 		Port:          port,
+		Mode:          parsed["mode"],
+		ADMSPort:      admsPort,
 	})
 }
 
@@ -253,8 +284,19 @@ func normalizeConfig(cfg Config) (Config, error) {
 	cfg.ZKBioURL = strings.TrimRight(strings.TrimSpace(cfg.ZKBioURL), "/")
 	cfg.ZKBioUsername = strings.TrimSpace(cfg.ZKBioUsername)
 	cfg.ZKBioPassword = strings.TrimSpace(cfg.ZKBioPassword)
+	cfg.Mode = strings.ToLower(strings.TrimSpace(cfg.Mode))
 	if cfg.Port == 0 {
 		cfg.Port = 9800
+	}
+	if cfg.Mode == "" {
+		cfg.Mode = "zkbio"
+	}
+	if cfg.ADMSPort == 0 {
+		cfg.ADMSPort = 8081
+	}
+
+	if cfg.Mode != "zkbio" && cfg.Mode != "adms" {
+		return Config{}, fmt.Errorf("invalid mode %q: must be \"zkbio\" or \"adms\"", cfg.Mode)
 	}
 
 	switch {
@@ -262,12 +304,17 @@ func normalizeConfig(cfg Config) (Config, error) {
 		return Config{}, errors.New("missing api_key")
 	case cfg.PlamatixURL == "":
 		return Config{}, errors.New("missing plasmatix_url")
-	case cfg.ZKBioURL == "":
-		return Config{}, errors.New("missing zkbio_url")
-	case cfg.ZKBioUsername == "":
-		return Config{}, errors.New("missing zkbio_username")
-	case cfg.ZKBioPassword == "":
-		return Config{}, errors.New("missing zkbio_password")
+	}
+
+	if cfg.Mode == "zkbio" {
+		switch {
+		case cfg.ZKBioURL == "":
+			return Config{}, errors.New("missing zkbio_url")
+		case cfg.ZKBioUsername == "":
+			return Config{}, errors.New("missing zkbio_username")
+		case cfg.ZKBioPassword == "":
+			return Config{}, errors.New("missing zkbio_password")
+		}
 	}
 
 	return cfg, nil
@@ -287,6 +334,11 @@ func (a *Agent) connectLoop() {
 		time.Sleep(backoff)
 		backoff = min(backoff*2, maxBackoff)
 	}
+}
+
+func (a *Agent) startADMSServer() {
+	log.Printf("ADMS server listening on :%d", a.config.ADMSPort)
+	// TODO: implement in next task
 }
 
 func (a *Agent) connectSSE() error {

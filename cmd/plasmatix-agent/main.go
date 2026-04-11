@@ -452,7 +452,7 @@ func (s *ADMSServer) relayAttendance(att ADMSAttendance) {
 			return
 		}
 
-		attURL := fmt.Sprintf("%s/api/agent/attlog", s.agent.config.PlamatixURL)
+		attURL := fmt.Sprintf("%s/api/agent-bridge/attlog", s.agent.config.PlamatixURL)
 		req, err := http.NewRequest(http.MethodPost, attURL, strings.NewReader(string(body)))
 		if err != nil {
 			log.Printf("[ADMS] Create attlog request error: %v", err)

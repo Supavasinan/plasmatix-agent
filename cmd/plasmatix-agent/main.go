@@ -404,6 +404,7 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 
 		if table == "ATTLOG" {
 			lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+			received := 0
 			for _, line := range lines {
 				line = strings.TrimSpace(line)
 				if line == "" {
@@ -427,8 +428,10 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 					WorkCode:   workCode,
 					DeviceSN:   sn,
 				}
+				received++
 				s.relayAttendance(att)
 			}
+			log.Printf("[ADMS] Received ATTLOG from SN=%s (%d rows)", sn, received)
 		} else {
 			log.Printf("[ADMS] Received table=%s from SN=%s (%d bytes)", table, sn, len(body))
 		}
@@ -478,7 +481,11 @@ func (s *ADMSServer) relayAttendance(att ADMSAttendance) {
 		if res.StatusCode != http.StatusOK {
 			respBody, _ := io.ReadAll(res.Body)
 			log.Printf("[ADMS] Post attlog failed (HTTP %d): %s", res.StatusCode, string(respBody))
+			return
 		}
+
+		log.Printf("[ADMS] Relayed ATTLOG: SN=%s UserID=%s PunchTime=%s",
+			att.DeviceSN, att.UserID, att.PunchTime)
 	}()
 }
 
@@ -922,6 +929,11 @@ func withZKBio[T any](
 	sessions *SessionManager,
 	fn func(*ZKBioClient) (T, error),
 ) (T, error) {
+	if sessions == nil {
+		var zero T
+		return zero, errors.New("ZKBio client unavailable: agent is running in ADMS mode")
+	}
+
 	client, err := sessions.Client(ctx, false)
 	if err != nil {
 		var zero T
@@ -1538,4 +1550,3 @@ func firstNonEmpty(values ...string) string {
 	}
 	return ""
 }
-

@@ -37,12 +37,15 @@ type Config struct {
 	ZKBioUsername  string
 	ZKBioPassword  string
 	Port          int
+	Mode          string
+	ADMSPort      int
 }
 
 type Agent struct {
 	config    Config
 	startedAt time.Time
 	sessions  *SessionManager
+	adms      *ADMSServer
 }
 
 type loginResponse struct {
@@ -162,6 +165,27 @@ type SessionManager struct {
 	loginErr error
 }
 
+type ADMSServer struct {
+	agent    *Agent
+	mu       sync.Mutex
+	cmdQueue map[string][]ADMSCommand
+	cmdID    int
+}
+
+type ADMSCommand struct {
+	ID      int
+	Command string
+}
+
+type ADMSAttendance struct {
+	UserID     string `json:"userId"`
+	PunchTime  string `json:"punchTime"`
+	Status     int    `json:"status"`
+	VerifyMode int    `json:"verifyMode"`
+	WorkCode   int    `json:"workCode"`
+	DeviceSN   string `json:"deviceSN"`
+}
+
 func main() {
 	configPath := flag.String("config", "/etc/plasmatix/agent.yaml", "Path to agent config")
 	showVersion := flag.Bool("version", false, "Print version and exit")
@@ -180,13 +204,20 @@ func main() {
 	agent := &Agent{
 		config:    cfg,
 		startedAt: time.Now(),
-		sessions: &SessionManager{
+	}
+	if cfg.Mode == "zkbio" {
+		agent.sessions = &SessionManager{
 			config: cfg,
 			ttl:    sessionTTL,
-		},
+		}
 	}
 
-	log.Printf("plasmatix-agent %s starting", version)
+	log.Printf("plasmatix-agent %s starting (mode: %s)", version, cfg.Mode)
+
+	if cfg.Mode == "adms" {
+		go agent.startADMSServer()
+	}
+
 	agent.connectLoop()
 }
 
@@ -203,11 +234,22 @@ func loadConfig(path string) (Config, error) {
 		ZKBioUsername string `json:"zkbio_username"`
 		ZKBioPassword string `json:"zkbio_password"`
 		Port          int    `json:"port"`
+		Mode          string `json:"mode"`
+		ADMSPort      int    `json:"adms_port"`
 	}
 
 	var jc jsonConfig
 	if json.Unmarshal(raw, &jc) == nil && jc.APIKey != "" {
-		return normalizeConfig(Config(jc))
+		return normalizeConfig(Config{
+			APIKey:        jc.APIKey,
+			PlamatixURL:   jc.PlamatixURL,
+			ZKBioURL:      jc.ZKBioURL,
+			ZKBioUsername:  jc.ZKBioUsername,
+			ZKBioPassword:  jc.ZKBioPassword,
+			Port:          jc.Port,
+			Mode:          jc.Mode,
+			ADMSPort:      jc.ADMSPort,
+		})
 	}
 
 	parsed := map[string]string{}
@@ -237,6 +279,15 @@ func loadConfig(path string) (Config, error) {
 		port = parsedPort
 	}
 
+	admsPort := 0
+	if parsed["adms_port"] != "" {
+		parsedADMSPort, err := strconv.Atoi(parsed["adms_port"])
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid adms_port: %w", err)
+		}
+		admsPort = parsedADMSPort
+	}
+
 	return normalizeConfig(Config{
 		APIKey:        parsed["api_key"],
 		PlamatixURL:   parsed["plasmatix_url"],
@@ -244,6 +295,8 @@ func loadConfig(path string) (Config, error) {
 		ZKBioUsername: parsed["zkbio_username"],
 		ZKBioPassword: parsed["zkbio_password"],
 		Port:          port,
+		Mode:          parsed["mode"],
+		ADMSPort:      admsPort,
 	})
 }
 
@@ -253,8 +306,19 @@ func normalizeConfig(cfg Config) (Config, error) {
 	cfg.ZKBioURL = strings.TrimRight(strings.TrimSpace(cfg.ZKBioURL), "/")
 	cfg.ZKBioUsername = strings.TrimSpace(cfg.ZKBioUsername)
 	cfg.ZKBioPassword = strings.TrimSpace(cfg.ZKBioPassword)
+	cfg.Mode = strings.ToLower(strings.TrimSpace(cfg.Mode))
 	if cfg.Port == 0 {
 		cfg.Port = 9800
+	}
+	if cfg.Mode == "" {
+		cfg.Mode = "zkbio"
+	}
+	if cfg.ADMSPort == 0 {
+		cfg.ADMSPort = 8081
+	}
+
+	if cfg.Mode != "zkbio" && cfg.Mode != "adms" {
+		return Config{}, fmt.Errorf("invalid mode %q: must be \"zkbio\" or \"adms\"", cfg.Mode)
 	}
 
 	switch {
@@ -262,12 +326,17 @@ func normalizeConfig(cfg Config) (Config, error) {
 		return Config{}, errors.New("missing api_key")
 	case cfg.PlamatixURL == "":
 		return Config{}, errors.New("missing plasmatix_url")
-	case cfg.ZKBioURL == "":
-		return Config{}, errors.New("missing zkbio_url")
-	case cfg.ZKBioUsername == "":
-		return Config{}, errors.New("missing zkbio_username")
-	case cfg.ZKBioPassword == "":
-		return Config{}, errors.New("missing zkbio_password")
+	}
+
+	if cfg.Mode == "zkbio" {
+		switch {
+		case cfg.ZKBioURL == "":
+			return Config{}, errors.New("missing zkbio_url")
+		case cfg.ZKBioUsername == "":
+			return Config{}, errors.New("missing zkbio_username")
+		case cfg.ZKBioPassword == "":
+			return Config{}, errors.New("missing zkbio_password")
+		}
 	}
 
 	return cfg, nil
@@ -287,6 +356,181 @@ func (a *Agent) connectLoop() {
 		time.Sleep(backoff)
 		backoff = min(backoff*2, maxBackoff)
 	}
+}
+
+func (a *Agent) startADMSServer() {
+	a.adms = &ADMSServer{
+		agent:    a,
+		cmdQueue: make(map[string][]ADMSCommand),
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/iclock/cdata", a.adms.handleCData)
+	mux.HandleFunc("/iclock/getrequest", a.adms.handleGetRequest)
+	mux.HandleFunc("/iclock/devicecmd", a.adms.handleDeviceCmd)
+	mux.HandleFunc("/iclock/ping", a.adms.handlePing)
+
+	addr := fmt.Sprintf(":%d", a.config.ADMSPort)
+	log.Printf("ADMS server listening on %s", addr)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Fatalf("ADMS server error: %v", err)
+	}
+}
+
+// ── ADMS handlers ──────────────────────────────────────────────────────────────
+
+func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
+	sn := r.URL.Query().Get("SN")
+
+	if r.Method == http.MethodGet {
+		log.Printf("[ADMS] Device registered: SN=%s", sn)
+		resp := fmt.Sprintf(
+			"GET OPTION FROM: %s\nStamp=9999\nOpStamp=9999\nErrorDelay=60\nDelay=3\nTransInterval=1\nTransFlag=1111000000\nRealtime=1\nEncrypt=0",
+			sn,
+		)
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, resp)
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		table := r.URL.Query().Get("table")
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("[ADMS] Error reading body: %v", err)
+			fmt.Fprint(w, "OK")
+			return
+		}
+
+		if table == "ATTLOG" {
+			lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				fields := strings.Split(line, "\t")
+				if len(fields) < 5 {
+					log.Printf("[ADMS] Invalid ATTLOG line: %s", line)
+					continue
+				}
+
+				status, _ := strconv.Atoi(strings.TrimSpace(fields[2]))
+				verifyMode, _ := strconv.Atoi(strings.TrimSpace(fields[3]))
+				workCode, _ := strconv.Atoi(strings.TrimSpace(fields[4]))
+
+				att := ADMSAttendance{
+					UserID:     strings.TrimSpace(fields[0]),
+					PunchTime:  strings.TrimSpace(fields[1]),
+					Status:     status,
+					VerifyMode: verifyMode,
+					WorkCode:   workCode,
+					DeviceSN:   sn,
+				}
+				s.relayAttendance(att)
+			}
+		} else {
+			log.Printf("[ADMS] Received table=%s from SN=%s (%d bytes)", table, sn, len(body))
+		}
+
+		fmt.Fprint(w, "OK")
+		return
+	}
+
+	fmt.Fprint(w, "OK")
+}
+
+func (s *ADMSServer) relayAttendance(att ADMSAttendance) {
+	go func() {
+		payload := map[string]any{
+			"type": "attlog",
+			"data": att,
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			log.Printf("[ADMS] Marshal attlog error: %v", err)
+			return
+		}
+
+		attURL := fmt.Sprintf("%s/api/agent-bridge/attlog", s.agent.config.PlamatixURL)
+		req, err := http.NewRequest(http.MethodPost, attURL, strings.NewReader(string(body)))
+		if err != nil {
+			log.Printf("[ADMS] Create attlog request error: %v", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", s.agent.config.APIKey)
+
+		client := &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+
+		res, err := client.Do(req)
+		if err != nil {
+			log.Printf("[ADMS] Post attlog error: %v", err)
+			return
+		}
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusOK {
+			respBody, _ := io.ReadAll(res.Body)
+			log.Printf("[ADMS] Post attlog failed (HTTP %d): %s", res.StatusCode, string(respBody))
+		}
+	}()
+}
+
+func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
+	sn := r.URL.Query().Get("SN")
+
+	s.mu.Lock()
+	queue := s.cmdQueue[sn]
+	if len(queue) == 0 {
+		s.mu.Unlock()
+		fmt.Fprint(w, "OK")
+		return
+	}
+	cmd := queue[0]
+	s.cmdQueue[sn] = queue[1:]
+	s.mu.Unlock()
+
+	resp := fmt.Sprintf("C:%d:%s", cmd.ID, cmd.Command)
+	fmt.Fprint(w, resp)
+}
+
+func (s *ADMSServer) enqueueCommand(sn, command string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cmdID++
+	id := s.cmdID
+	s.cmdQueue[sn] = append(s.cmdQueue[sn], ADMSCommand{
+		ID:      id,
+		Command: command,
+	})
+	return id
+}
+
+func (s *ADMSServer) handleDeviceCmd(w http.ResponseWriter, r *http.Request) {
+	sn := r.URL.Query().Get("SN")
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("[ADMS] Error reading devicecmd body: %v", err)
+		fmt.Fprint(w, "OK")
+		return
+	}
+
+	params, _ := url.ParseQuery(string(body))
+	log.Printf("[ADMS] Device command result: SN=%s ID=%s Return=%s CMD=%s",
+		sn, params.Get("ID"), params.Get("Return"), params.Get("CMD"))
+
+	fmt.Fprint(w, "OK")
+}
+
+func (s *ADMSServer) handlePing(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprint(w, "OK")
 }
 
 func (a *Agent) connectSSE() error {
@@ -409,6 +653,44 @@ func (a *Agent) handleCommand(requestId, command string, params map[string]strin
 		result, cmdErr = withZKBio(ctx, a.sessions, func(client *ZKBioClient) ([]ZKBioMonthlyReport, error) {
 			return client.FetchMonthlyReport(ctx, params["month"], params["year"])
 		})
+	case "syncUser":
+		if a.adms == nil {
+			cmdErr = fmt.Errorf("ADMS server not running")
+		} else {
+			sn := params["deviceSN"]
+			pin := params["pin"]
+			name := params["name"]
+			card := params["card"]
+			cmd := fmt.Sprintf("DATA UPDATE USERINFO PIN=%s\tName=%s\tCard=%s", pin, name, card)
+			id := a.adms.enqueueCommand(sn, cmd)
+			result = map[string]any{"status": "queued", "commandId": id}
+		}
+	case "deleteUser":
+		if a.adms == nil {
+			cmdErr = fmt.Errorf("ADMS server not running")
+		} else {
+			sn := params["deviceSN"]
+			pin := params["pin"]
+			cmd := fmt.Sprintf("DATA DELETE USERINFO PIN=%s", pin)
+			id := a.adms.enqueueCommand(sn, cmd)
+			result = map[string]any{"status": "queued", "commandId": id}
+		}
+	case "queryUsers":
+		if a.adms == nil {
+			cmdErr = fmt.Errorf("ADMS server not running")
+		} else {
+			sn := params["deviceSN"]
+			id := a.adms.enqueueCommand(sn, "DATA QUERY USERINFO")
+			result = map[string]any{"status": "queued", "commandId": id}
+		}
+	case "rebootDevice":
+		if a.adms == nil {
+			cmdErr = fmt.Errorf("ADMS server not running")
+		} else {
+			sn := params["deviceSN"]
+			id := a.adms.enqueueCommand(sn, "REBOOT")
+			result = map[string]any{"status": "queued", "commandId": id}
+		}
 	default:
 		cmdErr = fmt.Errorf("unknown command: %s", command)
 	}

@@ -186,6 +186,29 @@ type ADMSAttendance struct {
 	DeviceSN   string `json:"deviceSN"`
 }
 
+// SenseFace 2A and other access-control devices push table=rtlog instead
+// of ATTLOG. Plasmatix's /agent-bridge/attlog accepts this shape under
+// type:"rtlog" and filters non-punch system events server-side.
+type ADMSRtlog struct {
+	DeviceSN    string `json:"deviceSN"`
+	Time        string `json:"time"`
+	Pin         string `json:"pin"`
+	CardNo      string `json:"cardno,omitempty"`
+	EventAddr   string `json:"eventaddr,omitempty"`
+	Event       int    `json:"event"`
+	InOutStatus int    `json:"inoutstatus"`
+	VerifyType  int    `json:"verifytype"`
+	Index       int    `json:"index,omitempty"`
+}
+
+// Response shape from GET /agent-bridge/devices/:sn/state — used to
+// decide whether the next handshake should reset stamps for a full backfill.
+type deviceSyncState struct {
+	PendingFullSync   bool    `json:"pendingFullSync"`
+	PendingFullSyncAt *string `json:"pendingFullSyncAt"`
+	LastFullSyncAt    *string `json:"lastFullSyncAt"`
+}
+
 func main() {
 	configPath := flag.String("config", "/etc/plasmatix/agent.yaml", "Path to agent config")
 	showVersion := flag.Bool("version", false, "Print version and exit")
@@ -369,6 +392,8 @@ func (a *Agent) startADMSServer() {
 	mux.HandleFunc("/iclock/getrequest", a.adms.handleGetRequest)
 	mux.HandleFunc("/iclock/devicecmd", a.adms.handleDeviceCmd)
 	mux.HandleFunc("/iclock/ping", a.adms.handlePing)
+	mux.HandleFunc("/iclock/registry", a.adms.handleRegistry)
+	mux.HandleFunc("/iclock/push", a.adms.handlePush)
 
 	addr := fmt.Sprintf(":%d", a.config.ADMSPort)
 	log.Printf("ADMS server listening on %s", addr)
@@ -381,15 +406,37 @@ func (a *Agent) startADMSServer() {
 
 func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 	sn := r.URL.Query().Get("SN")
+	w.Header().Set("Content-Type", "text/plain")
 
 	if r.Method == http.MethodGet {
-		log.Printf("[ADMS] Device registered: SN=%s", sn)
+		// Per-handshake check: if Plasmatix has a pending full-sync request
+		// for this SN, return Stamp=0 so the device replays its full local
+		// backlog, then ack so the flag clears.
+		fullSync := false
+		if sn != "" {
+			state, err := s.fetchDeviceState(sn)
+			if err != nil {
+				log.Printf("[ADMS] state fetch failed for SN=%s: %v", sn, err)
+			} else if state.PendingFullSync {
+				fullSync = true
+				log.Printf("[ADMS] Full-sync requested for SN=%s, returning Stamp=0", sn)
+			}
+		}
+
+		stamp := "9999"
+		if fullSync {
+			stamp = "0"
+		}
+
 		resp := fmt.Sprintf(
-			"GET OPTION FROM: %s\nStamp=9999\nOpStamp=9999\nErrorDelay=60\nDelay=3\nTransInterval=1\nTransFlag=1111000000\nRealtime=1\nEncrypt=0",
-			sn,
+			"GET OPTION FROM: %s\nATTLOGStamp=%s\nOPERLOGStamp=%s\nATTPHOTOStamp=None\nErrorDelay=30\nDelay=10\nTransTimes=00:00;14:05\nTransInterval=1\nTransFlag=TransData AttLog OpLog AttPhoto EnrollUser ChgUser EnrollFP ChgFP UserPic\nTimeZone=7\nRealtime=1\nEncrypt=None",
+			sn, stamp, stamp,
 		)
-		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprint(w, resp)
+
+		if fullSync {
+			go s.ackFullSync(sn)
+		}
 		return
 	}
 
@@ -402,10 +449,10 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if table == "ATTLOG" {
-			lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+		switch table {
+		case "ATTLOG":
 			received := 0
-			for _, line := range lines {
+			for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
 				line = strings.TrimSpace(line)
 				if line == "" {
 					continue
@@ -420,19 +467,43 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 				verifyMode, _ := strconv.Atoi(strings.TrimSpace(fields[3]))
 				workCode, _ := strconv.Atoi(strings.TrimSpace(fields[4]))
 
-				att := ADMSAttendance{
+				received++
+				s.relayAttendance(ADMSAttendance{
 					UserID:     strings.TrimSpace(fields[0]),
 					PunchTime:  strings.TrimSpace(fields[1]),
 					Status:     status,
 					VerifyMode: verifyMode,
 					WorkCode:   workCode,
 					DeviceSN:   sn,
-				}
-				received++
-				s.relayAttendance(att)
+				})
 			}
 			log.Printf("[ADMS] Received ATTLOG from SN=%s (%d rows)", sn, received)
-		} else {
+
+		case "rtlog":
+			received := 0
+			for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				fields := parseTabKV(line)
+				rt := ADMSRtlog{
+					DeviceSN:    sn,
+					Time:        fields["time"],
+					Pin:         fields["pin"],
+					CardNo:      fields["cardno"],
+					EventAddr:   fields["eventaddr"],
+					Event:       atoiOrZero(fields["event"]),
+					InOutStatus: atoiOrZero(fields["inoutstatus"]),
+					VerifyType:  atoiOrZero(fields["verifytype"]),
+					Index:       atoiOrZero(fields["index"]),
+				}
+				received++
+				s.relayRtlog(rt)
+			}
+			log.Printf("[ADMS] Received rtlog from SN=%s (%d rows)", sn, received)
+
+		default:
 			log.Printf("[ADMS] Received table=%s from SN=%s (%d bytes)", table, sn, len(body))
 		}
 
@@ -441,6 +512,21 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 	}
 
 	fmt.Fprint(w, "OK")
+}
+
+func parseTabKV(line string) map[string]string {
+	out := map[string]string{}
+	for _, pair := range strings.Split(line, "\t") {
+		if i := strings.IndexByte(pair, '='); i >= 0 {
+			out[pair[:i]] = pair[i+1:]
+		}
+	}
+	return out
+}
+
+func atoiOrZero(s string) int {
+	n, _ := strconv.Atoi(strings.TrimSpace(s))
+	return n
 }
 
 func (s *ADMSServer) relayAttendance(att ADMSAttendance) {
@@ -487,6 +573,139 @@ func (s *ADMSServer) relayAttendance(att ADMSAttendance) {
 		log.Printf("[ADMS] Relayed ATTLOG: SN=%s UserID=%s PunchTime=%s",
 			att.DeviceSN, att.UserID, att.PunchTime)
 	}()
+}
+
+func (s *ADMSServer) relayRtlog(rt ADMSRtlog) {
+	go func() {
+		payload := map[string]any{
+			"type": "rtlog",
+			"data": rt,
+		}
+		body, err := json.Marshal(payload)
+		if err != nil {
+			log.Printf("[ADMS] Marshal rtlog error: %v", err)
+			return
+		}
+
+		attURL := fmt.Sprintf("%s/api/agent-bridge/attlog", s.agent.config.PlamatixURL)
+		req, err := http.NewRequest(http.MethodPost, attURL, strings.NewReader(string(body)))
+		if err != nil {
+			log.Printf("[ADMS] Create rtlog request error: %v", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", s.agent.config.APIKey)
+
+		client := &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+
+		res, err := client.Do(req)
+		if err != nil {
+			log.Printf("[ADMS] Post rtlog error: %v", err)
+			return
+		}
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusOK {
+			respBody, _ := io.ReadAll(res.Body)
+			log.Printf("[ADMS] Post rtlog failed (HTTP %d): %s", res.StatusCode, string(respBody))
+			return
+		}
+
+		log.Printf("[ADMS] Relayed rtlog: SN=%s pin=%s time=%s event=%d verify=%d index=%d",
+			rt.DeviceSN, rt.Pin, rt.Time, rt.Event, rt.VerifyType, rt.Index)
+	}()
+}
+
+func (s *ADMSServer) fetchDeviceState(sn string) (deviceSyncState, error) {
+	stateURL := fmt.Sprintf("%s/api/agent-bridge/devices/%s/state", s.agent.config.PlamatixURL, url.PathEscape(sn))
+	req, err := http.NewRequest(http.MethodGet, stateURL, nil)
+	if err != nil {
+		return deviceSyncState{}, err
+	}
+	req.Header.Set("X-API-Key", s.agent.config.APIKey)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return deviceSyncState{}, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode == http.StatusNotFound {
+		// Device row not provisioned yet — treat as no pending sync, no error.
+		return deviceSyncState{}, nil
+	}
+	if res.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(res.Body)
+		return deviceSyncState{}, fmt.Errorf("HTTP %d: %s", res.StatusCode, string(respBody))
+	}
+
+	var state deviceSyncState
+	if err := json.NewDecoder(res.Body).Decode(&state); err != nil {
+		return deviceSyncState{}, fmt.Errorf("decode state: %w", err)
+	}
+	return state, nil
+}
+
+func (s *ADMSServer) ackFullSync(sn string) {
+	ackURL := fmt.Sprintf("%s/api/agent-bridge/devices/%s/ack-full-sync", s.agent.config.PlamatixURL, url.PathEscape(sn))
+	req, err := http.NewRequest(http.MethodPost, ackURL, nil)
+	if err != nil {
+		log.Printf("[ADMS] Create ack request error: %v", err)
+		return
+	}
+	req.Header.Set("X-API-Key", s.agent.config.APIKey)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		log.Printf("[ADMS] Ack full-sync error: %v", err)
+		return
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(res.Body)
+		log.Printf("[ADMS] Ack full-sync failed (HTTP %d): %s", res.StatusCode, string(respBody))
+		return
+	}
+	log.Printf("[ADMS] Acked full-sync for SN=%s", sn)
+}
+
+// SenseFace 2A and other ZKBio CVAccess devices register their capabilities
+// here on every handshake. Returning RegistryCode keeps the device from
+// looping back into the cdata GET indefinitely.
+func (s *ADMSServer) handleRegistry(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	code := strings.ToUpper(strconv.FormatInt(time.Now().Unix(), 16))
+	fmt.Fprintf(w, "RegistryCode=%s", code)
+}
+
+// PUSH 3.x devices open this channel for real-time event delivery.
+// Returning push-channel config (not bare OK) prevents reconnect loops.
+func (s *ADMSServer) handlePush(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprint(w,
+		"ServerVersion=3.1.2\nServerName=ADMS\nPushVersion=3.1.2\n"+
+			"ErrorDelay=30\nRequestDelay=10\nTransInterval=1\n"+
+			"TransTables=User Transaction Facev7 templatev10\n"+
+			"TimeZone=7\nRealTime=1\nTimeoutSec=30",
+	)
 }
 
 func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {

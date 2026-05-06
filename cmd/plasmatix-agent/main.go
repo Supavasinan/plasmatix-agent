@@ -34,8 +34,8 @@ type Config struct {
 	APIKey        string
 	PlamatixURL   string
 	ZKBioURL      string
-	ZKBioUsername  string
-	ZKBioPassword  string
+	ZKBioUsername string
+	ZKBioPassword string
 	Port          int
 	Mode          string
 	ADMSPort      int
@@ -166,15 +166,29 @@ type SessionManager struct {
 }
 
 type ADMSServer struct {
-	agent    *Agent
-	mu       sync.Mutex
-	cmdQueue map[string][]ADMSCommand
-	cmdID    int
+	agent      *Agent
+	mu         sync.Mutex
+	cmdQueue   map[string][]ADMSCommand
+	cmdID      int
+	pendingCmd map[int]ADMSCommand
+	cloudCmdID map[string]struct{}
 }
 
 type ADMSCommand struct {
 	ID      int
 	Command string
+	CloudID string
+	Label   string
+}
+
+type cloudCommand struct {
+	ID    string `json:"id"`
+	Cmd   string `json:"cmd"`
+	Label string `json:"label"`
+}
+
+type cloudCommandsResponse struct {
+	Commands []cloudCommand `json:"commands"`
 }
 
 type ADMSAttendance struct {
@@ -267,8 +281,8 @@ func loadConfig(path string) (Config, error) {
 			APIKey:        jc.APIKey,
 			PlamatixURL:   jc.PlamatixURL,
 			ZKBioURL:      jc.ZKBioURL,
-			ZKBioUsername:  jc.ZKBioUsername,
-			ZKBioPassword:  jc.ZKBioPassword,
+			ZKBioUsername: jc.ZKBioUsername,
+			ZKBioPassword: jc.ZKBioPassword,
 			Port:          jc.Port,
 			Mode:          jc.Mode,
 			ADMSPort:      jc.ADMSPort,
@@ -383,8 +397,10 @@ func (a *Agent) connectLoop() {
 
 func (a *Agent) startADMSServer() {
 	a.adms = &ADMSServer{
-		agent:    a,
-		cmdQueue: make(map[string][]ADMSCommand),
+		agent:      a,
+		cmdQueue:   make(map[string][]ADMSCommand),
+		pendingCmd: make(map[int]ADMSCommand),
+		cloudCmdID: make(map[string]struct{}),
 	}
 
 	mux := http.NewServeMux()
@@ -711,6 +727,14 @@ func (s *ADMSServer) handlePush(w http.ResponseWriter, r *http.Request) {
 func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 	sn := r.URL.Query().Get("SN")
 
+	if sn != "" {
+		if n, err := s.drainCloudCommands(sn); err != nil {
+			log.Printf("[ADMS] Cloud command drain failed for SN=%s: %v", sn, err)
+		} else if n > 0 {
+			log.Printf("[ADMS] Queued %d cloud command(s) for SN=%s", n, sn)
+		}
+	}
+
 	s.mu.Lock()
 	queue := s.cmdQueue[sn]
 	if len(queue) == 0 {
@@ -720,6 +744,7 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	cmd := queue[0]
 	s.cmdQueue[sn] = queue[1:]
+	s.pendingCmd[cmd.ID] = cmd
 	s.mu.Unlock()
 
 	resp := fmt.Sprintf("C:%d:%s", cmd.ID, cmd.Command)
@@ -727,16 +752,75 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *ADMSServer) enqueueCommand(sn, command string) int {
+	return s.enqueueADMSCommand(sn, command, "", "")
+}
+
+func (s *ADMSServer) enqueueADMSCommand(sn, command, cloudID, label string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if cloudID != "" {
+		if _, exists := s.cloudCmdID[cloudID]; exists {
+			return 0
+		}
+	}
 
 	s.cmdID++
 	id := s.cmdID
 	s.cmdQueue[sn] = append(s.cmdQueue[sn], ADMSCommand{
 		ID:      id,
 		Command: command,
+		CloudID: cloudID,
+		Label:   label,
 	})
+	if cloudID != "" {
+		s.cloudCmdID[cloudID] = struct{}{}
+	}
 	return id
+}
+
+func (s *ADMSServer) drainCloudCommands(sn string) (int, error) {
+	commandsURL := fmt.Sprintf("%s/api/agent-bridge/commands?deviceSn=%s&limit=10", s.agent.config.PlamatixURL, url.QueryEscape(sn))
+	req, err := http.NewRequest(http.MethodGet, commandsURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-API-Key", s.agent.config.APIKey)
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(res.Body)
+		return 0, fmt.Errorf("HTTP %d: %s", res.StatusCode, string(respBody))
+	}
+
+	var payload cloudCommandsResponse
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		return 0, fmt.Errorf("decode commands: %w", err)
+	}
+
+	for _, cmd := range payload.Commands {
+		if strings.TrimSpace(cmd.ID) == "" || strings.TrimSpace(cmd.Cmd) == "" {
+			continue
+		}
+		id := s.enqueueADMSCommand(sn, cmd.Cmd, cmd.ID, cmd.Label)
+		if id == 0 {
+			continue
+		}
+		log.Printf("[ADMS] Cloud command queued: SN=%s localID=%d cloudID=%s label=%q", sn, id, cmd.ID, cmd.Label)
+	}
+
+	return len(payload.Commands), nil
 }
 
 func (s *ADMSServer) handleDeviceCmd(w http.ResponseWriter, r *http.Request) {
@@ -752,7 +836,69 @@ func (s *ADMSServer) handleDeviceCmd(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[ADMS] Device command result: SN=%s ID=%s Return=%s CMD=%s",
 		sn, params.Get("ID"), params.Get("Return"), params.Get("CMD"))
 
+	localID, err := strconv.Atoi(strings.TrimSpace(params.Get("ID")))
+	if err == nil {
+		s.mu.Lock()
+		cmd, ok := s.pendingCmd[localID]
+		if ok {
+			delete(s.pendingCmd, localID)
+			if cmd.CloudID != "" {
+				delete(s.cloudCmdID, cmd.CloudID)
+			}
+		}
+		s.mu.Unlock()
+
+		if ok && cmd.CloudID != "" {
+			returnCode := atoiOrZero(params.Get("Return"))
+			resultBody := strings.TrimSpace(string(body))
+			go s.reportCloudCommandResult(cmd.CloudID, returnCode, resultBody)
+		}
+	}
+
 	fmt.Fprint(w, "OK")
+}
+
+func (s *ADMSServer) reportCloudCommandResult(cloudID string, returnCode int, resultBody string) {
+	payload := map[string]any{
+		"id":         cloudID,
+		"returnCode": returnCode,
+		"resultBody": resultBody,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[ADMS] Marshal command result error: %v", err)
+		return
+	}
+
+	resultURL := fmt.Sprintf("%s/api/agent-bridge/commands/result", s.agent.config.PlamatixURL)
+	req, err := http.NewRequest(http.MethodPost, resultURL, strings.NewReader(string(body)))
+	if err != nil {
+		log.Printf("[ADMS] Create command result request error: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", s.agent.config.APIKey)
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		log.Printf("[ADMS] Post command result error: %v", err)
+		return
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(res.Body)
+		log.Printf("[ADMS] Post command result failed (HTTP %d): %s", res.StatusCode, string(respBody))
+		return
+	}
+
+	log.Printf("[ADMS] Reported cloud command result: cloudID=%s Return=%d", cloudID, returnCode)
 }
 
 func (s *ADMSServer) handlePing(w http.ResponseWriter, r *http.Request) {
@@ -879,6 +1025,34 @@ func (a *Agent) handleCommand(requestId, command string, params map[string]strin
 		result, cmdErr = withZKBio(ctx, a.sessions, func(client *ZKBioClient) ([]ZKBioMonthlyReport, error) {
 			return client.FetchMonthlyReport(ctx, params["month"], params["year"])
 		})
+	case "wake_device":
+		if a.adms == nil {
+			cmdErr = fmt.Errorf("ADMS server not running")
+		} else {
+			sn := firstNonEmpty(params["deviceSn"], params["deviceSN"], params["sn"])
+			if sn == "" {
+				cmdErr = fmt.Errorf("missing deviceSn")
+			} else {
+				n, err := a.adms.drainCloudCommands(sn)
+				if err != nil {
+					cmdErr = err
+				} else {
+					result = map[string]any{"status": "queued", "commands": n}
+				}
+			}
+		}
+	case "trigger_full_sync":
+		if a.adms == nil {
+			cmdErr = fmt.Errorf("ADMS server not running")
+		} else {
+			sn := firstNonEmpty(params["deviceSn"], params["deviceSN"], params["sn"])
+			if sn == "" {
+				cmdErr = fmt.Errorf("missing deviceSn")
+			} else {
+				id := a.adms.enqueueCommand(sn, "DATA QUERY ATTLOG")
+				result = map[string]any{"status": "queued", "commandId": id}
+			}
+		}
 	case "syncUser":
 		if a.adms == nil {
 			cmdErr = fmt.Errorf("ADMS server not running")

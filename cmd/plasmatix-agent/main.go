@@ -855,6 +855,7 @@ func (s *ADMSServer) handlePush(w http.ResponseWriter, r *http.Request) {
 func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 	sn := r.URL.Query().Get("SN")
 	s.agent.devices.noteContact(sn, r.RemoteAddr)
+	log.Printf("[ADMS] GET /iclock/getrequest from SN=%s remote=%s query=%s", sn, r.RemoteAddr, r.URL.RawQuery)
 
 	if sn != "" {
 		if n, err := s.drainCloudCommands(sn); err != nil {
@@ -868,6 +869,7 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 	queue := s.cmdQueue[sn]
 	if len(queue) == 0 {
 		s.mu.Unlock()
+		log.Printf("[ADMS] No command for SN=%s; responding OK", sn)
 		fmt.Fprint(w, "OK")
 		return
 	}

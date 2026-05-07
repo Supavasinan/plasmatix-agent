@@ -558,6 +558,10 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[ADMS] Received table=%s from SN=%s (%d bytes, query=%s)", table, sn, len(body), r.URL.RawQuery)
 			if table == "" {
 				logTableDataPreview(sn, "<empty>", body)
+				if strings.EqualFold(r.URL.Query().Get("type"), "BioData") {
+					fields := parseFirstTabKVLine(body)
+					log.Printf("[ADMS] BioData upload: SN=%s rows=%d keys=%s", sn, countADMSRows(body), strings.Join(fieldKeys(fields), ","))
+				}
 			}
 		}
 
@@ -593,17 +597,9 @@ func countADMSRows(body []byte) int {
 }
 
 func logTableDataPreview(sn, tableName string, body []byte) {
-	line := strings.TrimSpace(string(body))
-	if line == "" {
-		return
-	}
-	if i := strings.IndexByte(line, '\n'); i >= 0 {
-		line = line[:i]
-	}
-
-	fields := parseTabKV(line)
+	fields := parseFirstTabKVLine(body)
 	if len(fields) == 0 {
-		log.Printf("[ADMS] tabledata preview: SN=%s tablename=%s firstLineBytes=%d", sn, tableName, len(line))
+		log.Printf("[ADMS] tabledata preview: SN=%s tablename=%s bodyBytes=%d", sn, tableName, len(body))
 		return
 	}
 
@@ -634,6 +630,25 @@ func logTableDataPreview(sn, tableName string, body []byte) {
 		}
 	}
 	log.Printf("[ADMS] tabledata preview: SN=%s tablename=%s %s", sn, tableName, strings.Join(safe, " "))
+}
+
+func parseFirstTabKVLine(body []byte) map[string]string {
+	line := strings.TrimSpace(string(body))
+	if line == "" {
+		return map[string]string{}
+	}
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+	return parseTabKV(line)
+}
+
+func fieldKeys(fields map[string]string) []string {
+	keys := make([]string, 0, len(fields))
+	for key := range fields {
+		keys = append(keys, key)
+	}
+	return keys
 }
 
 func atoiOrZero(s string) int {

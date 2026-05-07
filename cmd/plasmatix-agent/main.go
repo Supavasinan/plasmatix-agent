@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1134,10 +1135,41 @@ func (s *ADMSServer) reflectBioData(sn string, body []byte) {
 		no = "0"
 	}
 
-	// Defaults match what ZKBio CVAccess pushes when uploads omit these.
-	// Without them, some firmwares parse the cmd OK (Return=0) but the
-	// matcher rejects the template because it can't determine the engine
-	// version or validity bit.
+	cmd, label := buildBioWriteCmd(pin, no, bioType, tmp, fields)
+	if cmd == "" {
+		log.Printf("[ADMS] reflectBioData skipped: SN=%s unsupported Type=%s", sn, bioType)
+		return
+	}
+
+	id := s.enqueueADMSCommand(sn, cmd, "", label)
+	log.Printf("[ADMS] Reflected BioData to SN=%s as cmd localID=%d (cmdLen=%d, tmpLen=%d, type=%s, uploadFields=%s)",
+		sn, id, len(cmd), len(tmp), bioType, strings.Join(fieldKeys(fields), ","))
+}
+
+// buildBioWriteCmd dispatches per bio type to the device-friendly verb.
+//
+// Type=1 (fingerprint): legacy DATA UPDATE FINGERTMP. PUSH 2.4 firmwares
+// reject DATA UPDATE BIODATA with Return=-30 ("template version mismatch")
+// because the matcher version isn't introspectable from the upload's
+// metadata, and our hardcoded MajorVer=39 / MinorVer=10 don't always match
+// the on-device engine. FINGERTMP doesn't carry version fields.
+//
+// Other types fall through to canonical DATA UPDATE BIODATA. Face (Type=9)
+// is left on BIODATA because face engines are version-tagged in the same
+// way modern fingerprint engines are; if face also returns -30 in practice
+// we can split it off too.
+func buildBioWriteCmd(pin, no, bioType, tmp string, fields map[string]string) (string, string) {
+	if bioType == "1" {
+		size := decodedTemplateSize(tmp)
+		cmd := fmt.Sprintf("DATA UPDATE FINGERTMP PIN=%s\tFID=%s\tSize=%d\tValid=1\tTMP=%s",
+			pin, no, size, tmp)
+		return cmd, fmt.Sprintf("reflect fingertmp pin=%s fid=%s", pin, no)
+	}
+	return buildCanonicalBioData(pin, no, bioType, tmp, fields),
+		fmt.Sprintf("reflect biodata pin=%s no=%s type=%s", pin, no, bioType)
+}
+
+func buildCanonicalBioData(pin, no, bioType, tmp string, fields map[string]string) string {
 	pickOrDefault := func(def string, keys ...string) string {
 		if v := firstField(fields, keys...); v != "" {
 			return v
@@ -1151,9 +1183,6 @@ func (s *ADMSServer) reflectBioData(sn string, body []byte) {
 	minorVer := pickOrDefault("10", "MinorVer", "MINORVER", "minorver")
 	format := pickOrDefault("0", "Format", "FORMAT", "format")
 
-	// Canonical mixed-case ordering as emitted by ZKBio CVAccess. The first
-	// param is space-separated from the verb; remaining params are TAB-
-	// separated.
 	var b strings.Builder
 	b.WriteString("DATA UPDATE BIODATA Pin=")
 	b.WriteString(pin)
@@ -1175,12 +1204,28 @@ func (s *ADMSServer) reflectBioData(sn string, body []byte) {
 	b.WriteString(format)
 	b.WriteString("\tTmp=")
 	b.WriteString(tmp)
+	return b.String()
+}
 
-	cmd := b.String()
-	label := fmt.Sprintf("reflect biodata pin=%s no=%s type=%s", pin, no, bioType)
-	id := s.enqueueADMSCommand(sn, cmd, "", label)
-	log.Printf("[ADMS] Reflected BioData to SN=%s as cmd localID=%d (cmdLen=%d, tmpLen=%d, uploadFields=%s)",
-		sn, id, len(cmd), len(tmp), strings.Join(fieldKeys(fields), ","))
+// decodedTemplateSize returns the raw byte length of a base64-encoded
+// template. DATA UPDATE FINGERTMP's Size= field is the decoded length, not
+// the base64 length — getting it wrong makes the device reject the write.
+func decodedTemplateSize(b64 string) int {
+	if decoded, err := base64.StdEncoding.DecodeString(b64); err == nil {
+		return len(decoded)
+	}
+	if decoded, err := base64.RawStdEncoding.DecodeString(b64); err == nil {
+		return len(decoded)
+	}
+	n := len(b64)
+	pad := 0
+	switch {
+	case strings.HasSuffix(b64, "=="):
+		pad = 2
+	case strings.HasSuffix(b64, "="):
+		pad = 1
+	}
+	return (n*3)/4 - pad
 }
 
 // handleQueryData accepts the device's reply to a server-issued DATA QUERY

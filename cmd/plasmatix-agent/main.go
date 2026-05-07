@@ -1097,11 +1097,18 @@ func (s *ADMSServer) handlePing(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "OK")
 }
 
-// reflectBioData enqueues "DATA UPDATE BIODATA <line>" back to the device that
+// reflectBioData enqueues "DATA UPDATE BIODATA …" back to the device that
 // just uploaded this BioData record. ZKBio CVAccess does this echo natively;
-// without it some firmwares (SenseFace 2A, Push 3.0) capture and upload the
-// template but never write it to the local matcher, so punching fails and the
-// device's per-user template count stays flat.
+// without it SenseFace 2A / Push 3.0 firmware captures the template, uploads
+// it, and returns Return=0 — but never writes it to the local matcher. So
+// punching fails and the per-user template count stays flat.
+//
+// Devices upload with uppercase keys (PIN/NO/TYPE/TMP) and omit MajorVer/
+// MinorVer/Format. The DATA UPDATE BIODATA parser on the same firmware is
+// case-strict on canonical Pin/No/Type/Tmp and requires the matcher-version
+// fields. We rebuild the command canonically rather than echoing verbatim,
+// otherwise the device accepts the command syntactically but silently drops
+// the template (Return=0 with no commit, no count bump).
 //
 // Only the first record line is reflected; multi-row BioData uploads would
 // need one DATA UPDATE per row (rare in practice).
@@ -1115,40 +1122,65 @@ func (s *ADMSServer) reflectBioData(sn string, body []byte) {
 	}
 
 	fields := parseTabKV(line)
-	pin := firstField(fields, "PIN", "Pin", "pin")
-	no := firstField(fields, "NO", "No", "no")
-	bioType := firstField(fields, "TYPE", "Type", "type")
-	if pin == "" || bioType == "" {
-		log.Printf("[ADMS] reflectBioData skipped: SN=%s missing PIN/TYPE in upload", sn)
+	pin := firstField(fields, "Pin", "PIN", "pin")
+	no := firstField(fields, "No", "NO", "no")
+	bioType := firstField(fields, "Type", "TYPE", "type")
+	tmp := firstField(fields, "Tmp", "TMP", "tmp")
+	if pin == "" || bioType == "" || tmp == "" {
+		log.Printf("[ADMS] reflectBioData skipped: SN=%s missing Pin/Type/Tmp in upload", sn)
 		return
 	}
+	if no == "" {
+		no = "0"
+	}
 
-	// Augment with fields the matcher needs but minimal firmwares don't emit.
-	// Idempotent: if the device already sent them, we don't duplicate.
-	has := func(keys ...string) bool {
-		for _, k := range keys {
-			if _, ok := fields[k]; ok {
-				return true
-			}
+	// Defaults match what ZKBio CVAccess pushes when uploads omit these.
+	// Without them, some firmwares parse the cmd OK (Return=0) but the
+	// matcher rejects the template because it can't determine the engine
+	// version or validity bit.
+	pickOrDefault := func(def string, keys ...string) string {
+		if v := firstField(fields, keys...); v != "" {
+			return v
 		}
-		return false
+		return def
 	}
-	augmented := line
-	if !has("Valid", "VALID", "valid") {
-		augmented += "\tValid=1"
-	}
-	if !has("Index", "INDEX", "index") {
-		augmented += "\tIndex=0"
-	}
-	if !has("Duress", "DURESS", "duress") {
-		augmented += "\tDuress=0"
-	}
+	valid := pickOrDefault("1", "Valid", "VALID", "valid")
+	index := pickOrDefault("0", "Index", "INDEX", "index")
+	duress := pickOrDefault("0", "Duress", "DURESS", "duress")
+	majorVer := pickOrDefault("39", "MajorVer", "MAJORVER", "majorver")
+	minorVer := pickOrDefault("10", "MinorVer", "MINORVER", "minorver")
+	format := pickOrDefault("0", "Format", "FORMAT", "format")
 
-	cmd := "DATA UPDATE BIODATA " + augmented
+	// Canonical mixed-case ordering as emitted by ZKBio CVAccess. The first
+	// param is space-separated from the verb; remaining params are TAB-
+	// separated.
+	var b strings.Builder
+	b.WriteString("DATA UPDATE BIODATA Pin=")
+	b.WriteString(pin)
+	b.WriteString("\tNo=")
+	b.WriteString(no)
+	b.WriteString("\tIndex=")
+	b.WriteString(index)
+	b.WriteString("\tValid=")
+	b.WriteString(valid)
+	b.WriteString("\tDuress=")
+	b.WriteString(duress)
+	b.WriteString("\tType=")
+	b.WriteString(bioType)
+	b.WriteString("\tMajorVer=")
+	b.WriteString(majorVer)
+	b.WriteString("\tMinorVer=")
+	b.WriteString(minorVer)
+	b.WriteString("\tFormat=")
+	b.WriteString(format)
+	b.WriteString("\tTmp=")
+	b.WriteString(tmp)
+
+	cmd := b.String()
 	label := fmt.Sprintf("reflect biodata pin=%s no=%s type=%s", pin, no, bioType)
 	id := s.enqueueADMSCommand(sn, cmd, "", label)
-	log.Printf("[ADMS] Reflected BioData to SN=%s as cmd localID=%d (cmdLen=%d, fields=%s)",
-		sn, id, len(cmd), strings.Join(fieldKeys(fields), ","))
+	log.Printf("[ADMS] Reflected BioData to SN=%s as cmd localID=%d (cmdLen=%d, tmpLen=%d, uploadFields=%s)",
+		sn, id, len(cmd), len(tmp), strings.Join(fieldKeys(fields), ","))
 }
 
 // handleQueryData accepts the device's reply to a server-issued DATA QUERY

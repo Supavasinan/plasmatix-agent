@@ -546,12 +546,19 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 				tableName, sn, received, len(body), r.URL.RawQuery)
 			logTableDataPreview(sn, tableName, body)
 			if tableName != "" {
+				if strings.EqualFold(tableName, "ATTPHOTO") {
+					fmt.Fprint(w, "OK")
+					return
+				}
 				fmt.Fprintf(w, "%s=%d\n", tableName, received)
 				return
 			}
 
 		default:
-			log.Printf("[ADMS] Received table=%s from SN=%s (%d bytes)", table, sn, len(body))
+			log.Printf("[ADMS] Received table=%s from SN=%s (%d bytes, query=%s)", table, sn, len(body), r.URL.RawQuery)
+			if table == "" {
+				logTableDataPreview(sn, "<empty>", body)
+			}
 		}
 
 		fmt.Fprint(w, "OK")

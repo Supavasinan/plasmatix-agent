@@ -167,12 +167,13 @@ type SessionManager struct {
 }
 
 type ADMSServer struct {
-	agent      *Agent
-	mu         sync.Mutex
-	cmdQueue   map[string][]ADMSCommand
-	cmdID      int
-	pendingCmd map[int]ADMSCommand
-	cloudCmdID map[string]struct{}
+	agent        *Agent
+	mu           sync.Mutex
+	cmdQueue     map[string][]ADMSCommand
+	cmdID        int
+	pendingCmd   map[int]ADMSCommand
+	cloudCmdID   map[string]struct{}
+	queryBuffers map[string][]byte
 }
 
 type ADMSCommand struct {
@@ -413,19 +414,24 @@ func (a *Agent) connectLoop() {
 
 func (a *Agent) startADMSServer() {
 	a.adms = &ADMSServer{
-		agent:      a,
-		cmdQueue:   make(map[string][]ADMSCommand),
-		pendingCmd: make(map[int]ADMSCommand),
-		cloudCmdID: make(map[string]struct{}),
+		agent:        a,
+		cmdQueue:     make(map[string][]ADMSCommand),
+		pendingCmd:   make(map[int]ADMSCommand),
+		cloudCmdID:   make(map[string]struct{}),
+		queryBuffers: make(map[string][]byte),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/iclock/cdata", a.adms.handleCData)
 	mux.HandleFunc("/iclock/getrequest", a.adms.handleGetRequest)
 	mux.HandleFunc("/iclock/devicecmd", a.adms.handleDeviceCmd)
+	mux.HandleFunc("/iclock/querydata", a.adms.handleQueryData)
 	mux.HandleFunc("/iclock/ping", a.adms.handlePing)
 	mux.HandleFunc("/iclock/registry", a.adms.handleRegistry)
 	mux.HandleFunc("/iclock/push", a.adms.handlePush)
+	// Catch-all so any unknown /iclock/* path 200s instead of 404ing the
+	// device into a retry loop. Specific patterns above still take priority.
+	mux.HandleFunc("/iclock/", a.adms.handleICLockFallback)
 
 	addr := fmt.Sprintf(":%d", a.config.ADMSPort)
 	log.Printf("ADMS server listening on %s", addr)
@@ -1082,6 +1088,98 @@ func (s *ADMSServer) reportBiometricTemplateUpload(sn, pin string, bioType, temp
 
 func (s *ADMSServer) handlePing(w http.ResponseWriter, r *http.Request) {
 	s.agent.devices.noteContact(r.URL.Query().Get("SN"), r.RemoteAddr)
+	fmt.Fprint(w, "OK")
+}
+
+// handleQueryData accepts the device's reply to a server-issued DATA QUERY
+// command. The device POSTs queried table rows here, optionally split across
+// multiple packs (packcnt/packidx). Without this handler the default mux
+// returned 404 and the device looped on the same querydata POST forever,
+// never advancing to /iclock/getrequest — which is why pending cloud
+// commands (ENROLL_BIO etc.) never reached the device.
+func (s *ADMSServer) handleQueryData(w http.ResponseWriter, r *http.Request) {
+	sn := r.URL.Query().Get("SN")
+	s.agent.devices.noteContact(sn, r.RemoteAddr)
+	w.Header().Set("Content-Type", "text/plain")
+
+	cmdidStr := r.URL.Query().Get("cmdid")
+	tableName := r.URL.Query().Get("tablename")
+	queryType := r.URL.Query().Get("type")
+	packCnt := atoiOrZero(r.URL.Query().Get("packcnt"))
+	packIdx := atoiOrZero(r.URL.Query().Get("packidx"))
+	if packCnt < 1 {
+		packCnt = 1
+	}
+	if packIdx < 1 {
+		packIdx = 1
+	}
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("[ADMS] querydata read error: SN=%s cmdid=%s err=%v", sn, cmdidStr, err)
+		writeQueryDataAck(w, cmdidStr)
+		return
+	}
+
+	log.Printf("[ADMS] POST /iclock/querydata SN=%s cmdid=%s type=%s tablename=%s pack=%d/%d bytes=%d",
+		sn, cmdidStr, queryType, tableName, packIdx, packCnt, len(body))
+
+	finalPack := packIdx >= packCnt
+	var aggregated []byte
+
+	if cmdidStr != "" && packCnt > 1 {
+		key := fmt.Sprintf("%s|%s", sn, cmdidStr)
+		s.mu.Lock()
+		s.queryBuffers[key] = append(s.queryBuffers[key], body...)
+		if finalPack {
+			aggregated = s.queryBuffers[key]
+			delete(s.queryBuffers, key)
+		}
+		s.mu.Unlock()
+	} else if finalPack {
+		aggregated = body
+	}
+
+	if finalPack {
+		if localID, parseErr := strconv.Atoi(strings.TrimSpace(cmdidStr)); parseErr == nil {
+			s.mu.Lock()
+			cmd, ok := s.pendingCmd[localID]
+			if ok {
+				delete(s.pendingCmd, localID)
+				if cmd.CloudID != "" {
+					delete(s.cloudCmdID, cmd.CloudID)
+				}
+			}
+			s.mu.Unlock()
+
+			if ok && cmd.CloudID != "" {
+				go s.reportCloudCommandResult(cmd.CloudID, 0, string(aggregated))
+			}
+		}
+	}
+
+	writeQueryDataAck(w, cmdidStr)
+}
+
+// ZK iClock Proxy firmwares expect "OK: <cmdid>" so the device can mark the
+// specific cmd done; bare "OK" is accepted as a fallback when no cmdid was
+// supplied.
+func writeQueryDataAck(w http.ResponseWriter, cmdid string) {
+	if cmdid != "" {
+		fmt.Fprintf(w, "OK: %s", cmdid)
+		return
+	}
+	fmt.Fprint(w, "OK")
+}
+
+// handleICLockFallback claims any /iclock/* path no specific handler took.
+// 200 OK keeps the device's protocol state machine moving instead of
+// hammering a 404 retry loop and starving /iclock/getrequest.
+func (s *ADMSServer) handleICLockFallback(w http.ResponseWriter, r *http.Request) {
+	s.agent.devices.noteContact(r.URL.Query().Get("SN"), r.RemoteAddr)
+	log.Printf("[ADMS] Unhandled %s %s from %s query=%s",
+		r.Method, r.URL.Path, r.RemoteAddr, r.URL.RawQuery)
+	w.Header().Set("Content-Type", "text/plain")
 	fmt.Fprint(w, "OK")
 }
 

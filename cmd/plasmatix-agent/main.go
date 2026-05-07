@@ -46,6 +46,7 @@ type Agent struct {
 	sessions  *SessionManager
 	adms      *ADMSServer
 	devices   *DeviceTracker
+	logs      *LogBuffer
 }
 
 type loginResponse struct {
@@ -238,10 +239,14 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	logs := newLogBuffer(500)
+	log.SetOutput(io.MultiWriter(os.Stderr, logs))
+
 	agent := &Agent{
 		config:    cfg,
 		startedAt: time.Now(),
 		devices:   newDeviceTracker(),
+		logs:      logs,
 	}
 	if cfg.Mode == "zkbio" {
 		agent.sessions = &SessionManager{
@@ -1087,6 +1092,18 @@ func (a *Agent) handleCommand(requestId, command string, params map[string]strin
 			sn := params["deviceSN"]
 			id := a.adms.enqueueCommand(sn, "REBOOT")
 			result = map[string]any{"status": "queued", "commandId": id}
+		}
+	case "logs":
+		limit := 200
+		if v, ok := params["limit"]; ok {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				limit = n
+			}
+		}
+		if a.logs == nil {
+			result = map[string]any{"entries": []LogEntry{}}
+		} else {
+			result = map[string]any{"entries": a.logs.Snapshot(limit)}
 		}
 	default:
 		cmdErr = fmt.Errorf("unknown command: %s", command)

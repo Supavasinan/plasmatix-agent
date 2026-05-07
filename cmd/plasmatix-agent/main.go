@@ -871,16 +871,13 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "OK")
 		return
 	}
-	s.cmdQueue[sn] = nil
-	lines := make([]string, 0, len(queue))
-	for _, cmd := range queue {
-		s.pendingCmd[cmd.ID] = cmd
-		lines = append(lines, fmt.Sprintf("C:%d:%s", cmd.ID, cmd.Command))
-	}
+	cmd := queue[0]
+	s.cmdQueue[sn] = queue[1:]
+	s.pendingCmd[cmd.ID] = cmd
 	s.mu.Unlock()
 
-	log.Printf("[ADMS] Serving %d command(s) to SN=%s via getrequest", len(lines), sn)
-	fmt.Fprint(w, strings.Join(lines, "\n"))
+	log.Printf("[ADMS] Serving command to SN=%s localID=%d cloudID=%s label=%q", sn, cmd.ID, cmd.CloudID, cmd.Label)
+	fmt.Fprintf(w, "C:%d:%s", cmd.ID, cmd.Command)
 }
 
 func (s *ADMSServer) enqueueCommand(sn, command string) int {

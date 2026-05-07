@@ -561,6 +561,12 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 				if strings.EqualFold(r.URL.Query().Get("type"), "BioData") {
 					fields := parseFirstTabKVLine(body)
 					log.Printf("[ADMS] BioData upload: SN=%s rows=%d keys=%s", sn, countADMSRows(body), strings.Join(fieldKeys(fields), ","))
+					pin := firstField(fields, "PIN", "Pin", "pin")
+					bioType := atoiOrZero(firstField(fields, "TYPE", "Type", "type"))
+					templateNo := atoiOrZero(firstField(fields, "NO", "No", "no"))
+					if pin != "" && bioType > 0 {
+						go s.reportBiometricTemplateUpload(sn, pin, bioType, templateNo, countADMSRows(body), len(body), fieldKeys(fields))
+					}
 				}
 			}
 		}
@@ -649,6 +655,15 @@ func fieldKeys(fields map[string]string) []string {
 		keys = append(keys, key)
 	}
 	return keys
+}
+
+func firstField(fields map[string]string, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(fields[key]); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func atoiOrZero(s string) int {
@@ -1013,6 +1028,54 @@ func (s *ADMSServer) reportCloudCommandResult(cloudID string, returnCode int, re
 	}
 
 	log.Printf("[ADMS] Reported cloud command result: cloudID=%s Return=%d", cloudID, returnCode)
+}
+
+func (s *ADMSServer) reportBiometricTemplateUpload(sn, pin string, bioType, templateNo, rowCount, byteCount int, keys []string) {
+	payload := map[string]any{
+		"deviceSn":   sn,
+		"pin":        pin,
+		"bioType":    bioType,
+		"templateNo": templateNo,
+		"rowCount":   rowCount,
+		"byteCount":  byteCount,
+		"fieldKeys":  keys,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[ADMS] Marshal biometric template upload error: %v", err)
+		return
+	}
+
+	uploadURL := fmt.Sprintf("%s/api/agent-bridge/biometric-template", s.agent.config.PlamatixURL)
+	req, err := http.NewRequest(http.MethodPost, uploadURL, strings.NewReader(string(body)))
+	if err != nil {
+		log.Printf("[ADMS] Create biometric template upload request error: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-API-Key", s.agent.config.APIKey)
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		log.Printf("[ADMS] Post biometric template upload error: %v", err)
+		return
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(res.Body)
+		log.Printf("[ADMS] Post biometric template upload failed (HTTP %d): %s", res.StatusCode, string(respBody))
+		return
+	}
+
+	log.Printf("[ADMS] Reported biometric template upload: SN=%s PIN=%s TYPE=%d NO=%d rows=%d bytes=%d",
+		sn, pin, bioType, templateNo, rowCount, byteCount)
 }
 
 func (s *ADMSServer) handlePing(w http.ResponseWriter, r *http.Request) {

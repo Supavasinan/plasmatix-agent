@@ -536,6 +536,20 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Printf("[ADMS] Received rtlog from SN=%s (%d rows)", sn, received)
 
+		case "tabledata":
+			tableName := r.URL.Query().Get("tablename")
+			received := countADMSRows(body)
+			if received == 0 {
+				received = atoiOrZero(r.URL.Query().Get("count"))
+			}
+			log.Printf("[ADMS] Received table=tabledata tablename=%s from SN=%s (%d rows, %d bytes, query=%s)",
+				tableName, sn, received, len(body), r.URL.RawQuery)
+			logTableDataPreview(sn, tableName, body)
+			if tableName != "" {
+				fmt.Fprintf(w, "%s=%d\n", tableName, received)
+				return
+			}
+
 		default:
 			log.Printf("[ADMS] Received table=%s from SN=%s (%d bytes)", table, sn, len(body))
 		}
@@ -555,6 +569,64 @@ func parseTabKV(line string) map[string]string {
 		}
 	}
 	return out
+}
+
+func countADMSRows(body []byte) int {
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return 0
+	}
+	count := 0
+	for _, line := range strings.Split(trimmed, "\n") {
+		if strings.TrimSpace(line) != "" {
+			count++
+		}
+	}
+	return count
+}
+
+func logTableDataPreview(sn, tableName string, body []byte) {
+	line := strings.TrimSpace(string(body))
+	if line == "" {
+		return
+	}
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+
+	fields := parseTabKV(line)
+	if len(fields) == 0 {
+		log.Printf("[ADMS] tabledata preview: SN=%s tablename=%s firstLineBytes=%d", sn, tableName, len(line))
+		return
+	}
+
+	safe := make([]string, 0, len(fields))
+	for _, key := range []string{"PIN", "Pin", "pin", "UserID", "uid", "type", "Type", "bio_type", "no", "No", "fingerid", "FingerID", "valid", "Valid", "size", "sn"} {
+		value, ok := fields[key]
+		if !ok {
+			continue
+		}
+		if len(value) > 80 {
+			value = value[:80] + "..."
+		}
+		safe = append(safe, fmt.Sprintf("%s=%s", key, value))
+	}
+	if len(safe) == 0 {
+		for key, value := range fields {
+			lower := strings.ToLower(key)
+			if strings.Contains(lower, "photo") || strings.Contains(lower, "template") || strings.Contains(lower, "tmp") || strings.Contains(lower, "bio") {
+				continue
+			}
+			if len(value) > 80 {
+				value = value[:80] + "..."
+			}
+			safe = append(safe, fmt.Sprintf("%s=%s", key, value))
+			if len(safe) >= 6 {
+				break
+			}
+		}
+	}
+	log.Printf("[ADMS] tabledata preview: SN=%s tablename=%s %s", sn, tableName, strings.Join(safe, " "))
 }
 
 func atoiOrZero(s string) int {

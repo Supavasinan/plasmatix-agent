@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/md5"
 	"crypto/tls"
@@ -388,19 +387,22 @@ func normalizeConfig(cfg Config) (Config, error) {
 	return cfg, nil
 }
 
+// connectLoop drives the long-poll loop. Each pollOnce returns within ~25s
+// (server-side hold) or immediately when a command arrives. On success we
+// re-poll right away; on transport errors we back off so a flaky network
+// doesn't hammer the bridge.
 func (a *Agent) connectLoop() {
 	backoff := time.Second
 	maxBackoff := 30 * time.Second
 
 	for {
-		err := a.connectSSE()
-		if err != nil {
-			log.Printf("SSE connection error: %v", err)
+		if err := a.pollOnce(); err != nil {
+			log.Printf("Poll error: %v", err)
+			time.Sleep(backoff)
+			backoff = min(backoff*2, maxBackoff)
+			continue
 		}
-
-		log.Printf("Reconnecting in %s...", backoff)
-		time.Sleep(backoff)
-		backoff = min(backoff*2, maxBackoff)
+		backoff = time.Second
 	}
 }
 
@@ -919,19 +921,22 @@ func (s *ADMSServer) handlePing(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "OK")
 }
 
-func (a *Agent) connectSSE() error {
-	connectURL := fmt.Sprintf("%s/api/agent-bridge/connect?apiKey=%s",
+// pollOnce performs one long-poll round-trip against /api/agent-bridge/poll.
+// The server holds the request for up to ~25s. Returns nil on a clean
+// "no command" or successful command dispatch; returns an error on any
+// transport / HTTP / decode failure so the loop can back off.
+func (a *Agent) pollOnce() error {
+	pollURL := fmt.Sprintf("%s/api/agent-bridge/poll?apiKey=%s",
 		a.config.PlamatixURL, url.QueryEscape(a.config.APIKey))
 
-	req, err := http.NewRequest(http.MethodGet, connectURL, nil)
+	req, err := http.NewRequest(http.MethodGet, pollURL, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Cache-Control", "no-cache")
 
 	client := &http.Client{
-		Timeout: 0,
+		// Server holds for 25s; allow generous slack for slow networks.
+		Timeout: 35 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
@@ -939,52 +944,30 @@ func (a *Agent) connectSSE() error {
 
 	res, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("connect: %w", err)
+		return fmt.Errorf("poll: %w", err)
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(res.Body)
-		return fmt.Errorf("connect failed (HTTP %d): %s", res.StatusCode, string(body))
+		return fmt.Errorf("poll failed (HTTP %d): %s", res.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	log.Printf("Connected to Plasmatix at %s", a.config.PlamatixURL)
-
-	scanner := bufio.NewScanner(res.Body)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		payload := strings.TrimPrefix(line, "data: ")
-
-		var cmd struct {
+	var body struct {
+		Command *struct {
 			RequestID string            `json:"requestId"`
 			Command   string            `json:"command"`
 			Params    map[string]string `json:"params"`
-			Type      string            `json:"type"`
-		}
-
-		if err := json.Unmarshal([]byte(payload), &cmd); err != nil {
-			log.Printf("Invalid command: %v", err)
-			continue
-		}
-
-		if cmd.RequestID == "" {
-			if cmd.Type == "connected" {
-				log.Println("SSE connection confirmed")
-			}
-			continue
-		}
-
-		go a.handleCommand(cmd.RequestID, cmd.Command, cmd.Params)
+		} `json:"command"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		return fmt.Errorf("decode poll response: %w", err)
 	}
 
-	return scanner.Err()
+	if body.Command != nil && body.Command.RequestID != "" {
+		go a.handleCommand(body.Command.RequestID, body.Command.Command, body.Command.Params)
+	}
+	return nil
 }
 
 func (a *Agent) handleCommand(requestId, command string, params map[string]string) {

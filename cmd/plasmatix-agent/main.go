@@ -572,6 +572,12 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 					templateNo := atoiOrZero(firstField(fields, "NO", "No", "no"))
 					if pin != "" && bioType > 0 {
 						go s.reportBiometricTemplateUpload(sn, pin, bioType, templateNo, countADMSRows(body), len(body), fieldKeys(fields))
+						// Echo the captured template back as DATA UPDATE BIODATA so the
+						// device commits it to its local matcher. SenseFace/Push 3.0
+						// firmware doesn't auto-persist on ENROLL_BIO — without this
+						// echo the per-user template count never advances and the
+						// finger never matches at punch time.
+						s.reflectBioData(sn, body)
 					}
 				}
 			}
@@ -1089,6 +1095,60 @@ func (s *ADMSServer) reportBiometricTemplateUpload(sn, pin string, bioType, temp
 func (s *ADMSServer) handlePing(w http.ResponseWriter, r *http.Request) {
 	s.agent.devices.noteContact(r.URL.Query().Get("SN"), r.RemoteAddr)
 	fmt.Fprint(w, "OK")
+}
+
+// reflectBioData enqueues "DATA UPDATE BIODATA <line>" back to the device that
+// just uploaded this BioData record. ZKBio CVAccess does this echo natively;
+// without it some firmwares (SenseFace 2A, Push 3.0) capture and upload the
+// template but never write it to the local matcher, so punching fails and the
+// device's per-user template count stays flat.
+//
+// Only the first record line is reflected; multi-row BioData uploads would
+// need one DATA UPDATE per row (rare in practice).
+func (s *ADMSServer) reflectBioData(sn string, body []byte) {
+	line := strings.TrimSpace(string(body))
+	if line == "" {
+		return
+	}
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = strings.TrimSpace(line[:i])
+	}
+
+	fields := parseTabKV(line)
+	pin := firstField(fields, "PIN", "Pin", "pin")
+	no := firstField(fields, "NO", "No", "no")
+	bioType := firstField(fields, "TYPE", "Type", "type")
+	if pin == "" || bioType == "" {
+		log.Printf("[ADMS] reflectBioData skipped: SN=%s missing PIN/TYPE in upload", sn)
+		return
+	}
+
+	// Augment with fields the matcher needs but minimal firmwares don't emit.
+	// Idempotent: if the device already sent them, we don't duplicate.
+	has := func(keys ...string) bool {
+		for _, k := range keys {
+			if _, ok := fields[k]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	augmented := line
+	if !has("Valid", "VALID", "valid") {
+		augmented += "\tValid=1"
+	}
+	if !has("Index", "INDEX", "index") {
+		augmented += "\tIndex=0"
+	}
+	if !has("Duress", "DURESS", "duress") {
+		augmented += "\tDuress=0"
+	}
+
+	cmd := "DATA UPDATE BIODATA " + augmented
+	label := fmt.Sprintf("reflect biodata pin=%s no=%s type=%s", pin, no, bioType)
+	id := s.enqueueADMSCommand(sn, cmd, "", label)
+	log.Printf("[ADMS] Reflected BioData to SN=%s as cmd localID=%d (cmdLen=%d, fields=%s)",
+		sn, id, len(cmd), strings.Join(fieldKeys(fields), ","))
 }
 
 // handleQueryData accepts the device's reply to a server-issued DATA QUERY

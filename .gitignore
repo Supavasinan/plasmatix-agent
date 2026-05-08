@@ -1,2 +1,4 @@
 /plasmatix-agent
 dist/
+.dev/
+scripts/dev/agent.local.json

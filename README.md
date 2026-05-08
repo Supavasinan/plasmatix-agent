@@ -20,6 +20,42 @@ The agent is installed via a generated script from the Plasmatix web UI. Go to *
 go build -trimpath -ldflags="-s -w -X main.version=$(cat VERSION)" -o plasmatix-agent ./cmd/plasmatix-agent
 ```
 
+## Local development (no remote deploy needed)
+
+The `Makefile` builds and runs the agent natively on macOS so you can iterate
+on `cmd/plasmatix-agent` without scping a binary anywhere.
+
+```bash
+# 1. One-time: copy the example config and fill in api_key + plasmatix_url.
+cp scripts/dev/agent.example.json scripts/dev/agent.local.json
+$EDITOR scripts/dev/agent.local.json
+
+# 2. Build + run with that config.
+make dev
+
+# 3. In another terminal, drive a fake ZKBio device against the local agent.
+#    Useful when no real device is on the same LAN as your Mac.
+make mock
+```
+
+Code change → Ctrl-C → `make dev` again. Build is ~2s native.
+
+The mock device handshakes, polls `/iclock/getrequest`, and when the agent
+serves an `ENROLL_BIO` it uploads a synthetic BioData record so the
+reflection path runs. Override defaults with env vars or flags:
+
+```bash
+AGENT_URL=http://127.0.0.1:8081 DEVICE_SN=NYU0000000001 make mock
+# or:
+go run ./scripts/dev/mock-device --agent http://127.0.0.1:8081 --sn NYU0000000001 --poll 1s
+```
+
+Other useful targets: `make build` (just compile), `make lint` (`go vet`),
+`make release-linux` / `make release-darwin` (cross-compile a deploy
+binary into `.dev/`), `make clean`.
+
+`scripts/dev/agent.local.json` and `.dev/` are gitignored.
+
 ## Release
 
 1. Bump the version in `VERSION`

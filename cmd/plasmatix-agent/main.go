@@ -45,6 +45,7 @@ type Agent struct {
 	config    Config
 	startedAt time.Time
 	sessions  *SessionManager
+	zkbiotime *ZKBioTimeClient
 	adms      *ADMSServer
 	devices   *DeviceTracker
 	logs      *LogBuffer
@@ -256,6 +257,9 @@ func main() {
 			ttl:    sessionTTL,
 		}
 	}
+	if cfg.Mode == "zkbiotime" {
+		agent.zkbiotime = newZKBioTimeClient(cfg)
+	}
 
 	log.Printf("plasmatix-agent %s starting (mode: %s)", version, cfg.Mode)
 
@@ -264,6 +268,10 @@ func main() {
 		// Active TCP probe is only useful when the agent has device IPs to
 		// probe — those come from incoming ADMS requests.
 		go agent.runProbeLoop(context.Background())
+	}
+	if cfg.Mode == "zkbiotime" {
+		// Pull ZKBioTime transactions periodically and relay them to /attlog.
+		go agent.runZKBioTimePollLoop(context.Background())
 	}
 
 	// Heartbeat runs in both modes — it carries the agent's own liveness
@@ -369,8 +377,8 @@ func normalizeConfig(cfg Config) (Config, error) {
 		cfg.ADMSPort = 8081
 	}
 
-	if cfg.Mode != "zkbio" && cfg.Mode != "adms" {
-		return Config{}, fmt.Errorf("invalid mode %q: must be \"zkbio\" or \"adms\"", cfg.Mode)
+	if cfg.Mode != "zkbio" && cfg.Mode != "adms" && cfg.Mode != "zkbiotime" {
+		return Config{}, fmt.Errorf("invalid mode %q: must be \"zkbio\", \"zkbiotime\" or \"adms\"", cfg.Mode)
 	}
 
 	switch {
@@ -380,7 +388,9 @@ func normalizeConfig(cfg Config) (Config, error) {
 		return Config{}, errors.New("missing plasmatix_url")
 	}
 
-	if cfg.Mode == "zkbio" {
+	// zkbio (CVAccess) and zkbiotime (BioTime 8 REST) both reach the server with
+	// url/username/password — stored in the same generic zkbio_* config keys.
+	if cfg.Mode == "zkbio" || cfg.Mode == "zkbiotime" {
 		switch {
 		case cfg.ZKBioURL == "":
 			return Config{}, errors.New("missing zkbio_url")
@@ -1430,6 +1440,28 @@ func (a *Agent) handleCommand(requestId, command string, params map[string]strin
 		result, cmdErr = withZKBio(ctx, a.sessions, func(client *ZKBioClient) ([]ZKBioMonthlyReport, error) {
 			return client.FetchMonthlyReport(ctx, params["month"], params["year"])
 		})
+	case "sync_employees":
+		result, cmdErr = a.cmdSyncEmployees(ctx, params)
+	case "resync_to_device":
+		result, cmdErr = a.cmdResyncToDevice(ctx, params)
+	case "zkbiotime_personnel_lists":
+		if c, err := a.zkClient(); err != nil {
+			cmdErr = err
+		} else {
+			result, cmdErr = c.fetchPersonnelLists(ctx)
+		}
+	case "zkbiotime_terminals":
+		if c, err := a.zkClient(); err != nil {
+			cmdErr = err
+		} else {
+			result, cmdErr = c.fetchTerminals(ctx)
+		}
+	case "zkbiotime_att_report":
+		if c, err := a.zkClient(); err != nil {
+			cmdErr = err
+		} else {
+			result, cmdErr = c.fetchAttReport(ctx, params["start"], params["end"])
+		}
 	case "wake_device":
 		if a.adms == nil {
 			cmdErr = fmt.Errorf("ADMS server not running")

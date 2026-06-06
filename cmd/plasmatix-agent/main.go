@@ -553,7 +553,16 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 				tableName, sn, received, len(body), r.URL.RawQuery)
 			logTableDataPreview(sn, tableName, body)
 			if tableName != "" {
-				if strings.EqualFold(tableName, "ATTPHOTO") {
+				// Standard realtime table pushes must be acked with a bare
+				// "OK". ZAM70 / Push 3.0 firmware does not recognize the
+				// count-style ack ("user=1") as success for these, so the
+				// device never clears the row from its outbound buffer and
+				// re-uploads it every few seconds forever (seen in prod as
+				// SN=NYU7253100765 spamming tablename=user pin=21). The
+				// "tablename=count" ack is only needed by the biometric
+				// template/photo tables (see commit 1f6d695).
+				if strings.EqualFold(tableName, "ATTPHOTO") ||
+					strings.EqualFold(tableName, "user") {
 					fmt.Fprint(w, "OK")
 					return
 				}

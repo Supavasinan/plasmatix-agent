@@ -178,14 +178,17 @@ func (c *ZKBioTimeClient) upsertEmployee(ctx context.Context, row map[string]str
 	return true, nil
 }
 
-// resign marks an employee as resigned in ZKBioTime.
-func (c *ZKBioTimeClient) resign(ctx context.Context, empCode, date, reason string) error {
+// resign marks an employee as resigned in ZKBioTime. It returns ok=true only
+// when an employee was found and actually resigned. An employee that doesn't
+// exist in ZKBioTime (never pushed) is already in the desired absent state, so
+// it's an idempotent no-op (ok=false, err=nil) rather than an error.
+func (c *ZKBioTimeClient) resign(ctx context.Context, empCode, date, reason string) (bool, error) {
 	id, found, err := c.findEmployeeID(ctx, empCode)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !found {
-		return fmt.Errorf("emp_code=%s not found", empCode)
+		return false, nil
 	}
 	body := map[string]any{
 		"employee":    id,
@@ -195,12 +198,12 @@ func (c *ZKBioTimeClient) resign(ctx context.Context, empCode, date, reason stri
 	}
 	code, resp, err := c.do(ctx, http.MethodPost, "/personnel/api/resigns/", nil, body)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if code < 200 || code >= 300 {
-		return fmt.Errorf("resign (HTTP %d): %s", code, truncate(string(resp), 200))
+		return false, fmt.Errorf("resign (HTTP %d): %s", code, truncate(string(resp), 200))
 	}
-	return nil
+	return true, nil
 }
 
 // reinstate reverses a resignation (best-effort; a non-resigned employee is a
@@ -423,11 +426,14 @@ func (a *Agent) cmdSyncEmployees(ctx context.Context, params map[string]string) 
 	}
 
 	for _, r := range resignations {
-		if err := c.resign(ctx, r.EmpCode, r.ResignDate, r.Reason); err != nil {
+		ok, err := c.resign(ctx, r.EmpCode, r.ResignDate, r.Reason)
+		if err != nil {
 			errs = append(errs, map[string]string{"emp_code": r.EmpCode, "message": err.Error()})
 			continue
 		}
-		resigned++
+		if ok {
+			resigned++
+		}
 	}
 
 	return map[string]any{

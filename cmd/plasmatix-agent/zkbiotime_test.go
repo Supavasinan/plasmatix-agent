@@ -1,7 +1,12 @@
 package main
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -71,5 +76,60 @@ func TestEmployeeBodyOmitsMissingIDs(t *testing.T) {
 		if _, ok := got[k]; ok {
 			t.Errorf("expected %q omitted when unset", k)
 		}
+	}
+}
+
+// resign on an employee that doesn't exist in ZKBioTime is an idempotent no-op,
+// not an error (they're already in the desired absent state).
+func TestResignNoOpWhenNotFound(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/personnel/api/employees/") {
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"data":[]}`)
+			return
+		}
+		t.Errorf("unexpected %s %s (should not POST a resign when not found)", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := &ZKBioTimeClient{baseURL: srv.URL, httpClient: srv.Client()}
+	ok, err := c.resign(context.Background(), "999", "2026-06-07", "")
+	if err != nil {
+		t.Fatalf("expected no error for missing employee, got %v", err)
+	}
+	if ok {
+		t.Fatalf("expected ok=false (no-op) for missing employee")
+	}
+}
+
+// resign on an existing employee posts the resignation and reports ok=true.
+func TestResignWhenFound(t *testing.T) {
+	posted := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/personnel/api/employees/"):
+			io.WriteString(w, `{"data":[{"id":42,"emp_code":"7"}]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/personnel/api/resigns/":
+			posted = true
+			io.WriteString(w, `{}`)
+		default:
+			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer srv.Close()
+
+	c := &ZKBioTimeClient{baseURL: srv.URL, httpClient: srv.Client()}
+	ok, err := c.resign(context.Background(), "7", "2026-06-07", "quit")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("expected ok=true when employee found")
+	}
+	if !posted {
+		t.Fatalf("expected POST to /personnel/api/resigns/")
 	}
 }

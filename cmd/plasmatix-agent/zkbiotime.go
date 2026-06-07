@@ -12,21 +12,17 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
 // ZKBioTimeClient talks to a ZKBioTime / BioTime 8 server over its REST API
-// (JWT auth). It is used when the agent runs in mode "zkbiotime". Credentials
-// arrive in the generic zkbio_url/username/password config keys.
+// (HTTP Basic auth). It is used when the agent runs in mode "zkbiotime".
+// Credentials arrive in the generic zkbio_url/username/password config keys.
 type ZKBioTimeClient struct {
 	baseURL    string
 	username   string
 	password   string
 	httpClient *http.Client
-
-	mu    sync.Mutex
-	token string
 }
 
 func newZKBioTimeClient(cfg Config) *ZKBioTimeClient {
@@ -44,90 +40,34 @@ func newZKBioTimeClient(cfg Config) *ZKBioTimeClient {
 	}
 }
 
-// login obtains a JWT token via POST /jwt-api-token-auth/.
-func (c *ZKBioTimeClient) login(ctx context.Context) error {
-	body, _ := json.Marshal(map[string]string{
-		"username": c.username,
-		"password": c.password,
-	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		c.baseURL+"/jwt-api-token-auth/", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	res, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("zkbiotime login: %w", err)
-	}
-	defer res.Body.Close()
-	respBody, _ := io.ReadAll(res.Body)
-	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("zkbiotime login failed (HTTP %d): %s", res.StatusCode, truncate(string(respBody), 200))
-	}
-	var out struct {
-		Token string `json:"token"`
-	}
-	if err := json.Unmarshal(respBody, &out); err != nil || out.Token == "" {
-		return fmt.Errorf("zkbiotime login: no token in response")
-	}
-	c.mu.Lock()
-	c.token = out.Token
-	c.mu.Unlock()
-	return nil
-}
-
-// do performs an authenticated JSON request, re-authenticating once on 401.
-// Returns the decoded status code and the raw body.
+// do performs an authenticated JSON request using HTTP Basic auth, returning
+// the status code and the raw body.
+//
+// Why Basic and not JWT: BioTime's IsNotOpenAPI permission rejects token/JWT
+// ("Open API") requests on /iclock/ and /personnel/ unless the API module is
+// licensed (enable_api), which trial licenses lack. HTTP Basic auth leaves
+// request.auth=None server-side, so it bypasses that gate — and it also works
+// on full licenses (where everything is allowed) — so we use it unconditionally.
 func (c *ZKBioTimeClient) do(ctx context.Context, method, path string, query url.Values, payload any) (int, []byte, error) {
-	c.mu.Lock()
-	token := c.token
-	c.mu.Unlock()
-	if token == "" {
-		if err := c.login(ctx); err != nil {
-			return 0, nil, err
-		}
-		c.mu.Lock()
-		token = c.token
-		c.mu.Unlock()
+	u := c.baseURL + path
+	if len(query) > 0 {
+		u += "?" + query.Encode()
 	}
-
-	send := func(tok string) (*http.Response, error) {
-		u := c.baseURL + path
-		if len(query) > 0 {
-			u += "?" + query.Encode()
-		}
-		var rdr io.Reader
-		if payload != nil {
-			b, _ := json.Marshal(payload)
-			rdr = bytes.NewReader(b)
-		}
-		req, err := http.NewRequestWithContext(ctx, method, u, rdr)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "JWT "+tok)
-		return c.httpClient.Do(req)
+	var rdr io.Reader
+	if payload != nil {
+		b, _ := json.Marshal(payload)
+		rdr = bytes.NewReader(b)
 	}
-
-	res, err := send(token)
+	req, err := http.NewRequestWithContext(ctx, method, u, rdr)
 	if err != nil {
 		return 0, nil, err
 	}
-	if res.StatusCode == http.StatusUnauthorized {
-		res.Body.Close()
-		if err := c.login(ctx); err != nil {
-			return 0, nil, err
-		}
-		c.mu.Lock()
-		token = c.token
-		c.mu.Unlock()
-		res, err = send(token)
-		if err != nil {
-			return 0, nil, err
-		}
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(c.username, c.password)
+
+	res, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, nil, err
 	}
 	defer res.Body.Close()
 	body, _ := io.ReadAll(res.Body)

@@ -93,7 +93,7 @@ func TestResignNoOpWhenNotFound(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &ZKBioTimeClient{baseURL: srv.URL, httpClient: srv.Client()}
+	c := newZKBioTimeClientWith(srv.URL, "x", "x", srv.Client())
 	ok, err := c.resign(context.Background(), "999", "2026-06-07", "")
 	if err != nil {
 		t.Fatalf("expected no error for missing employee, got %v", err)
@@ -121,7 +121,7 @@ func TestResignWhenFound(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	c := &ZKBioTimeClient{baseURL: srv.URL, httpClient: srv.Client()}
+	c := newZKBioTimeClientWith(srv.URL, "x", "x", srv.Client())
 	ok, err := c.resign(context.Background(), "7", "2026-06-07", "quit")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

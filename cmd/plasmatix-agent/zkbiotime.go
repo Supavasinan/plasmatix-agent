@@ -13,65 +13,52 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	zk "github.com/Supavasinan/zkbiotime-go"
 )
 
-// ZKBioTimeClient talks to a ZKBioTime / BioTime 8 server over its REST API
-// (HTTP Basic auth). It is used when the agent runs in mode "zkbiotime".
-// Credentials arrive in the generic zkbio_url/username/password config keys.
+// ZKBioTimeClient talks to a ZKBioTime / BioTime 8 server via the zkbiotime-go
+// SDK. It is used when the agent runs in mode "zkbiotime". Credentials arrive in
+// the generic zkbio_url/username/password config keys.
+//
+// The SDK uses HTTP Basic auth: BioTime's IsNotOpenAPI permission rejects
+// token/JWT ("Open API") requests on /iclock/ and /personnel/ unless the API
+// module is licensed (enable_api), which trial licenses lack. Basic auth leaves
+// request.auth=None server-side, bypassing that gate, and also works on full
+// licenses.
 type ZKBioTimeClient struct {
-	baseURL    string
-	username   string
-	password   string
-	httpClient *http.Client
+	sdk *zk.Client
 }
 
 func newZKBioTimeClient(cfg Config) *ZKBioTimeClient {
-	return &ZKBioTimeClient{
-		baseURL:  strings.TrimRight(cfg.ZKBioURL, "/"),
-		username: cfg.ZKBioUsername,
-		password: cfg.ZKBioPassword,
-		httpClient: &http.Client{
-			Timeout: 60 * time.Second,
-			Transport: &http.Transport{
-				// ZKBioTime on the LAN often uses a self-signed / internal cert.
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
+	return newZKBioTimeClientWith(cfg.ZKBioURL, cfg.ZKBioUsername, cfg.ZKBioPassword, &http.Client{
+		Timeout: 60 * time.Second,
+		Transport: &http.Transport{
+			// ZKBioTime on the LAN often uses a self-signed / internal cert.
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
-	}
+	})
 }
 
-// do performs an authenticated JSON request using HTTP Basic auth, returning
-// the status code and the raw body.
-//
-// Why Basic and not JWT: BioTime's IsNotOpenAPI permission rejects token/JWT
-// ("Open API") requests on /iclock/ and /personnel/ unless the API module is
-// licensed (enable_api), which trial licenses lack. HTTP Basic auth leaves
-// request.auth=None server-side, so it bypasses that gate — and it also works
-// on full licenses (where everything is allowed) — so we use it unconditionally.
-func (c *ZKBioTimeClient) do(ctx context.Context, method, path string, query url.Values, payload any) (int, []byte, error) {
-	u := c.baseURL + path
-	if len(query) > 0 {
-		u += "?" + query.Encode()
-	}
-	var rdr io.Reader
-	if payload != nil {
-		b, _ := json.Marshal(payload)
-		rdr = bytes.NewReader(b)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, u, rdr)
+func newZKBioTimeClientWith(baseURL, username, password string, hc *http.Client) *ZKBioTimeClient {
+	client, err := zk.New(zk.Options{
+		BaseURL:    strings.TrimRight(baseURL, "/"),
+		Username:   username,
+		Password:   password,
+		HTTPClient: hc,
+	})
 	if err != nil {
-		return 0, nil, err
+		// zk.New only fails on empty BaseURL/Username; config validation guarantees
+		// both in zkbiotime mode, so this is effectively unreachable.
+		log.Printf("[zkbiotime] client init: %v", err)
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.SetBasicAuth(c.username, c.password)
+	return &ZKBioTimeClient{sdk: client}
+}
 
-	res, err := c.httpClient.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer res.Body.Close()
-	body, _ := io.ReadAll(res.Body)
-	return res.StatusCode, body, nil
+// do delegates to the SDK's Raw escape hatch: an authenticated request returning
+// the status code and the undecoded body (a non-2xx status is not an error).
+func (c *ZKBioTimeClient) do(ctx context.Context, method, path string, query url.Values, payload any) (int, []byte, error) {
+	return c.sdk.Raw(ctx, method, path, query, payload)
 }
 
 func truncate(s string, n int) string {
@@ -96,30 +83,17 @@ func atoiPtr(s string) (int, bool) {
 
 // findEmployeeID returns the ZKBioTime employee id for an emp_code, if present.
 func (c *ZKBioTimeClient) findEmployeeID(ctx context.Context, empCode string) (int, bool, error) {
-	q := url.Values{"emp_code": {empCode}}
-	code, body, err := c.do(ctx, http.MethodGet, "/personnel/api/employees/", q, nil)
+	page, err := c.sdk.Employees.List(ctx, url.Values{"emp_code": {empCode}})
 	if err != nil {
 		return 0, false, err
 	}
-	if code != http.StatusOK {
-		return 0, false, fmt.Errorf("lookup emp_code=%s (HTTP %d): %s", empCode, code, truncate(string(body), 160))
-	}
-	var out struct {
-		Data []struct {
-			ID      int    `json:"id"`
-			EmpCode string `json:"emp_code"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &out); err != nil {
-		return 0, false, err
-	}
-	for _, e := range out.Data {
+	for _, e := range page.Data {
 		if e.EmpCode == empCode {
 			return e.ID, true, nil
 		}
 	}
-	if len(out.Data) > 0 {
-		return out.Data[0].ID, true, nil
+	if len(page.Data) > 0 {
+		return page.Data[0].ID, true, nil
 	}
 	return 0, false, nil
 }
@@ -244,74 +218,57 @@ type idName struct {
 	Name string `json:"name"`
 }
 
-func (c *ZKBioTimeClient) fetchList(ctx context.Context, path, nameField string) ([]idName, error) {
-	code, body, err := c.do(ctx, http.MethodGet, path, url.Values{"page_size": {"1000"}}, nil)
-	if err != nil {
-		return nil, err
-	}
-	if code != http.StatusOK {
-		return nil, fmt.Errorf("GET %s (HTTP %d): %s", path, code, truncate(string(body), 160))
-	}
-	var out struct {
-		Data []map[string]any `json:"data"`
-	}
-	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, err
-	}
-	list := make([]idName, 0, len(out.Data))
-	for _, row := range out.Data {
-		name, _ := row[nameField].(string)
-		list = append(list, idName{ID: row["id"], Name: name})
-	}
-	return list, nil
-}
-
 func (c *ZKBioTimeClient) fetchPersonnelLists(ctx context.Context) (map[string]any, error) {
-	depts, err := c.fetchList(ctx, "/personnel/api/departments/", "dept_name")
+	depts, err := c.sdk.Departments.ListAll(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	areas, err := c.fetchList(ctx, "/personnel/api/areas/", "area_name")
+	areas, err := c.sdk.Areas.ListAll(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	positions, err := c.fetchList(ctx, "/personnel/api/positions/", "position_name")
+	positions, err := c.sdk.Positions.ListAll(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{"departments": depts, "areas": areas, "positions": positions}, nil
+	di := make([]idName, len(depts))
+	for i, d := range depts {
+		di[i] = idName{ID: d.ID, Name: d.DeptName}
+	}
+	ai := make([]idName, len(areas))
+	for i, a := range areas {
+		ai[i] = idName{ID: a.ID, Name: a.AreaName}
+	}
+	pi := make([]idName, len(positions))
+	for i, p := range positions {
+		pi[i] = idName{ID: p.ID, Name: p.PositionName}
+	}
+	return map[string]any{"departments": di, "areas": ai, "positions": pi}, nil
 }
 
 func (c *ZKBioTimeClient) fetchTerminals(ctx context.Context) (map[string]any, error) {
-	code, body, err := c.do(ctx, http.MethodGet, "/iclock/api/terminals/", url.Values{"page_size": {"1000"}}, nil)
+	terms, err := c.sdk.Terminals.ListAll(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	if code != http.StatusOK {
-		return nil, fmt.Errorf("GET terminals (HTTP %d): %s", code, truncate(string(body), 160))
-	}
-	var out struct {
-		Data []map[string]any `json:"data"`
-	}
-	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, err
-	}
-	terminals := make([]map[string]any, 0, len(out.Data))
-	for _, t := range out.Data {
-		areaName := ""
-		if area, ok := t["area"].(map[string]any); ok {
-			areaName, _ = area["area_name"].(string)
+	out := make([]map[string]any, len(terms))
+	for i, t := range terms {
+		areaName := t.AreaName
+		if areaName == "" && t.Area.Object != nil {
+			if n, ok := t.Area.Object["area_name"].(string); ok {
+				areaName = n
+			}
 		}
-		terminals = append(terminals, map[string]any{
-			"id":            t["id"],
-			"sn":            t["sn"],
-			"alias":         t["alias"],
-			"ip_address":    t["ip_address"],
+		out[i] = map[string]any{
+			"id":            t.ID,
+			"sn":            t.SN,
+			"alias":         t.Alias,
+			"ip_address":    t.IPAddress,
 			"area_name":     areaName,
-			"last_activity": t["last_activity"],
-		})
+			"last_activity": t.LastActivity,
+		}
 	}
-	return map[string]any{"terminals": terminals}, nil
+	return map[string]any{"terminals": out}, nil
 }
 
 func (c *ZKBioTimeClient) fetchAttReport(ctx context.Context, start, end string) (map[string]any, error) {
@@ -322,21 +279,11 @@ func (c *ZKBioTimeClient) fetchAttReport(ctx context.Context, start, end string)
 	if end != "" {
 		q.Set("end_date", end)
 	}
-	code, body, err := c.do(ctx, http.MethodGet, "/att/api/transactionReport/", q, nil)
+	rep, err := c.sdk.Reports.Get(ctx, "transactionReport", q)
 	if err != nil {
 		return nil, err
 	}
-	if code != http.StatusOK {
-		return nil, fmt.Errorf("GET att report (HTTP %d): %s", code, truncate(string(body), 160))
-	}
-	var out struct {
-		Count int              `json:"count"`
-		Data  []map[string]any `json:"data"`
-	}
-	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, err
-	}
-	return map[string]any{"count": out.Count, "data": out.Data}, nil
+	return map[string]any{"count": rep.Count, "data": rep.Data}, nil
 }
 
 // fetchTransactions pulls raw punches in a time window (paginated).

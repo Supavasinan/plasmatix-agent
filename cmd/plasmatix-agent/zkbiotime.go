@@ -469,6 +469,52 @@ func (a *Agent) cmdResyncToDevice(ctx context.Context, params map[string]string)
 	return map[string]any{"resynced": len(empCodes), "failed": 0, "errors": []any{}}, nil
 }
 
+// ── Generic API passthrough (dev console) ────────────────────────────────────
+
+// cmdZkbiotimeRequest issues an arbitrary method/path/query/body against the
+// ZKBioTime server and returns {status, body}. It is confined to the configured
+// base URL (path must be relative, starting with "/"), so it can only reach the
+// org's own ZKBioTime. Drives the superadmin "Dev / API explorer" page.
+func (a *Agent) cmdZkbiotimeRequest(ctx context.Context, params map[string]string) (any, error) {
+	c, err := a.zkClient()
+	if err != nil {
+		return nil, err
+	}
+	method := strings.ToUpper(strings.TrimSpace(params["method"]))
+	if method == "" {
+		method = http.MethodGet
+	}
+	path := strings.TrimSpace(params["path"])
+	if !strings.HasPrefix(path, "/") {
+		return nil, fmt.Errorf("path must start with '/'")
+	}
+	q := url.Values{}
+	if s := strings.TrimSpace(params["query"]); s != "" {
+		var qm map[string]string
+		if err := json.Unmarshal([]byte(s), &qm); err != nil {
+			return nil, fmt.Errorf("query must be a JSON object of strings: %w", err)
+		}
+		for k, v := range qm {
+			q.Set(k, v)
+		}
+	}
+	var body any
+	if s := strings.TrimSpace(params["body"]); s != "" {
+		if err := json.Unmarshal([]byte(s), &body); err != nil {
+			return nil, fmt.Errorf("body must be valid JSON: %w", err)
+		}
+	}
+	code, respBody, err := c.do(ctx, method, path, q, body)
+	if err != nil {
+		return nil, err
+	}
+	var parsed any
+	if json.Unmarshal(respBody, &parsed) != nil {
+		parsed = string(respBody)
+	}
+	return map[string]any{"status": code, "body": parsed}, nil
+}
+
 // ── Transaction poll loop (Phase 0 pull) ─────────────────────────────────────
 
 // runZKBioTimePollLoop periodically pulls new transactions and relays them to

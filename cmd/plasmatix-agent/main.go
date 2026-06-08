@@ -1462,6 +1462,8 @@ func (a *Agent) handleCommand(requestId, command string, params map[string]strin
 		} else {
 			result, cmdErr = c.fetchAttReport(ctx, params["start"], params["end"])
 		}
+	case "zkbiotime_request":
+		result, cmdErr = a.cmdZkbiotimeRequest(ctx, params)
 	case "wake_device":
 		if a.adms == nil {
 			cmdErr = fmt.Errorf("ADMS server not running")

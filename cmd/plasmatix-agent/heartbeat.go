@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -166,12 +165,7 @@ func (a *Agent) postHeartbeat(ctx context.Context) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-API-Key", a.config.APIKey)
 
-	client := &http.Client{
-		Timeout: heartbeatHTTPTimeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	client := cloudHTTPClient(heartbeatHTTPTimeout)
 	res, err := client.Do(req)
 	if err != nil {
 		return err

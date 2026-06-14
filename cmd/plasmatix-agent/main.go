@@ -724,12 +724,7 @@ func (s *ADMSServer) relayAttendance(att ADMSAttendance) {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-API-Key", s.agent.config.APIKey)
 
-		client := &http.Client{
-			Timeout: 10 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-		}
+		client := cloudHTTPClient(10 * time.Second)
 
 		res, err := client.Do(req)
 		if err != nil {
@@ -770,12 +765,7 @@ func (s *ADMSServer) relayRtlog(rt ADMSRtlog) {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-API-Key", s.agent.config.APIKey)
 
-		client := &http.Client{
-			Timeout: 10 * time.Second,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			},
-		}
+		client := cloudHTTPClient(10 * time.Second)
 
 		res, err := client.Do(req)
 		if err != nil {
@@ -803,12 +793,7 @@ func (s *ADMSServer) fetchDeviceState(sn string) (deviceSyncState, error) {
 	}
 	req.Header.Set("X-API-Key", s.agent.config.APIKey)
 
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	client := cloudHTTPClient(5 * time.Second)
 	res, err := client.Do(req)
 	if err != nil {
 		return deviceSyncState{}, err
@@ -840,12 +825,7 @@ func (s *ADMSServer) ackFullSync(sn string) {
 	}
 	req.Header.Set("X-API-Key", s.agent.config.APIKey)
 
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	client := cloudHTTPClient(5 * time.Second)
 	res, err := client.Do(req)
 	if err != nil {
 		log.Printf("[ADMS] Ack full-sync error: %v", err)
@@ -950,12 +930,7 @@ func (s *ADMSServer) drainCloudCommands(sn string) (int, error) {
 	}
 	req.Header.Set("X-API-Key", s.agent.config.APIKey)
 
-	client := &http.Client{
-		Timeout: 5 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	client := cloudHTTPClient(5 * time.Second)
 	res, err := client.Do(req)
 	if err != nil {
 		return 0, err
@@ -1042,12 +1017,7 @@ func (s *ADMSServer) reportCloudCommandResult(cloudID string, returnCode int, re
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-API-Key", s.agent.config.APIKey)
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	client := cloudHTTPClient(10 * time.Second)
 	res, err := client.Do(req)
 	if err != nil {
 		log.Printf("[ADMS] Post command result error: %v", err)
@@ -1089,12 +1059,7 @@ func (s *ADMSServer) reportBiometricTemplateUpload(sn, pin string, bioType, temp
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-API-Key", s.agent.config.APIKey)
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	client := cloudHTTPClient(10 * time.Second)
 	res, err := client.Do(req)
 	if err != nil {
 		log.Printf("[ADMS] Post biometric template upload error: %v", err)
@@ -1344,21 +1309,18 @@ func (s *ADMSServer) handleICLockFallback(w http.ResponseWriter, r *http.Request
 // "no command" or successful command dispatch; returns an error on any
 // transport / HTTP / decode failure so the loop can back off.
 func (a *Agent) pollOnce() error {
-	pollURL := fmt.Sprintf("%s/api/agent-bridge/poll?apiKey=%s",
-		a.config.PlamatixURL, url.QueryEscape(a.config.APIKey))
+	pollURL := fmt.Sprintf("%s/api/agent-bridge/poll", a.config.PlamatixURL)
 
 	req, err := http.NewRequest(http.MethodGet, pollURL, nil)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
+	// Authenticate via header, not the query string, so the API key never lands
+	// in server/proxy access logs.
+	req.Header.Set("X-API-Key", a.config.APIKey)
 
-	client := &http.Client{
-		// Server holds for 25s; allow generous slack for slow networks.
-		Timeout: 35 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	// Server holds for 25s; allow generous slack for slow networks.
+	client := cloudHTTPClient(35 * time.Second)
 
 	res, err := client.Do(req)
 	if err != nil {
@@ -1580,12 +1542,7 @@ func (a *Agent) postResponse(requestId string, data any, cmdErr error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-API-Key", a.config.APIKey)
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	client := cloudHTTPClient(10 * time.Second)
 
 	res, err := client.Do(req)
 	if err != nil {
@@ -1659,6 +1616,15 @@ func (a *Agent) collectSystemInfo() map[string]any {
 	return info
 }
 
+// cloudHTTPClient returns an HTTP client for the Plasmatix cloud control
+// channel. TLS verification is intentionally enabled (Go's default transport):
+// the cloud presents a publicly-trusted certificate, so disabling verification
+// would let an on-path attacker MITM the command channel, steal the API key,
+// and deliver a malicious self-update binary.
+func cloudHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{Timeout: timeout}
+}
+
 func (a *Agent) selfUpdate() error {
 	binPath := "/usr/local/bin/plasmatix-agent"
 	goos := runtime.GOOS
@@ -1669,12 +1635,7 @@ func (a *Agent) selfUpdate() error {
 
 	log.Printf("Downloading new binary from %s...", downloadURL)
 
-	client := &http.Client{
-		Timeout: 120 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	client := cloudHTTPClient(120 * time.Second)
 
 	resp, err := client.Get(downloadURL)
 	if err != nil {

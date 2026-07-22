@@ -292,8 +292,9 @@ func (c *ZKBioTimeClient) fetchAttReport(ctx context.Context, start, end string)
 
 // fetchTransactions pulls raw punches in a time window (paginated).
 func (c *ZKBioTimeClient) fetchTransactions(ctx context.Context, start, end string) ([]map[string]any, error) {
-	var all []map[string]any
+	all := make([]map[string]any, 0)
 	page := 1
+	previousNext := ""
 	const maxPages = 200
 	for {
 		q := url.Values{
@@ -309,20 +310,34 @@ func (c *ZKBioTimeClient) fetchTransactions(ctx context.Context, start, end stri
 		if code != http.StatusOK {
 			return nil, fmt.Errorf("GET transactions (HTTP %d): %s", code, truncate(string(body), 160))
 		}
-		var out struct {
-			Next string           `json:"next"`
-			Data []map[string]any `json:"data"`
+		var envelope struct {
+			Next string          `json:"next"`
+			Data json.RawMessage `json:"data"`
 		}
-		if err := json.Unmarshal(body, &out); err != nil {
+		if err := json.Unmarshal(body, &envelope); err != nil {
 			return nil, err
 		}
-		all = append(all, out.Data...)
-		if out.Next == "" || len(out.Data) == 0 {
+		if len(envelope.Data) == 0 || bytes.Equal(bytes.TrimSpace(envelope.Data), []byte("null")) {
+			return nil, fmt.Errorf("GET transactions page %d has missing or null data", page)
+		}
+		var pageData []map[string]any
+		if err := json.Unmarshal(envelope.Data, &pageData); err != nil {
+			return nil, fmt.Errorf("decode transactions page %d data: %w", page, err)
+		}
+		if envelope.Next != "" && len(pageData) == 0 {
+			return nil, fmt.Errorf("GET transactions page %d is empty while pagination continues", page)
+		}
+		if envelope.Next != "" && envelope.Next == previousNext {
+			return nil, fmt.Errorf("GET transactions pagination stalled at page %d", page)
+		}
+		all = append(all, pageData...)
+		if envelope.Next == "" {
 			break
 		}
 		if page >= maxPages {
 			return nil, fmt.Errorf("GET transactions exceeded %d pages; refusing to acknowledge a partial backlog", maxPages)
 		}
+		previousNext = envelope.Next
 		page++
 	}
 	return all, nil
@@ -478,7 +493,6 @@ func (a *Agent) runZKBioTimePollLoop(ctx context.Context) {
 	if c == nil {
 		return
 	}
-	const overlap = 2 * time.Minute
 	const interval = 60 * time.Second
 
 	var hwm time.Time
@@ -501,22 +515,11 @@ func (a *Agent) runZKBioTimePollLoop(ctx context.Context) {
 			checkpointLoaded = true
 		}
 
-		now := time.Now().In(zkbioTimeLocation)
-		start := hwm.Add(-overlap).Format(zkbioTimeLayout)
-		end := now.Format(zkbioTimeLayout)
-		txns, err := c.fetchTransactions(ctx, start, end)
+		requestEnd := time.Now().In(zkbioTimeLocation)
+		nextCheckpoint, err := a.pullZKBioTimeTransactions(ctx, c, hwm, requestEnd)
 		if err != nil {
-			log.Printf("[zkbiotime] pull transactions: %v", err)
+			log.Printf("[zkbiotime] pull window: %v", err)
 			return
-		}
-
-		nextCheckpoint := now
-		if err := a.relayZKBioTimeTransactions(ctx, txns, nextCheckpoint); err != nil {
-			log.Printf("[zkbiotime] relay attlog: %v", err)
-			return
-		}
-		if len(txns) > 0 {
-			log.Printf("[zkbiotime] relayed %d transactions", len(txns))
 		}
 		hwm = nextCheckpoint
 	}
@@ -530,6 +533,46 @@ func (a *Agent) runZKBioTimePollLoop(ctx context.Context) {
 			pull()
 		}
 	}
+}
+
+func nextZKBioTimeCheckpoint(txns []map[string]any, requestEnd time.Time) time.Time {
+	var next time.Time
+	for _, txn := range txns {
+		uploadTime, ok := txn["upload_time"].(string)
+		if !ok {
+			continue
+		}
+		parsed, err := time.ParseInLocation(zkbioTimeLayout, strings.TrimSpace(uploadTime), zkbioTimeLocation)
+		if err != nil {
+			continue
+		}
+		if next.IsZero() || parsed.After(next) {
+			next = parsed
+		}
+	}
+	if next.IsZero() {
+		return requestEnd
+	}
+	return next
+}
+
+func (a *Agent) pullZKBioTimeTransactions(ctx context.Context, c *ZKBioTimeClient, hwm, requestEnd time.Time) (time.Time, error) {
+	const overlap = 2 * time.Minute
+	start := hwm.In(zkbioTimeLocation).Add(-overlap).Format(zkbioTimeLayout)
+	end := requestEnd.In(zkbioTimeLocation).Format(zkbioTimeLayout)
+	txns, err := c.fetchTransactions(ctx, start, end)
+	if err != nil {
+		return hwm, fmt.Errorf("pull transactions: %w", err)
+	}
+
+	nextCheckpoint := nextZKBioTimeCheckpoint(txns, requestEnd)
+	if err := a.relayZKBioTimeTransactions(ctx, txns, nextCheckpoint); err != nil {
+		return hwm, fmt.Errorf("relay attlog: %w", err)
+	}
+	if len(txns) > 0 {
+		log.Printf("[zkbiotime] relayed %d transactions", len(txns))
+	}
+	return nextCheckpoint, nil
 }
 
 func (a *Agent) fetchZKBioTimeCheckpoint(ctx context.Context) (time.Time, bool, error) {
@@ -552,15 +595,22 @@ func (a *Agent) fetchZKBioTimeCheckpoint(ctx context.Context) (time.Time, bool, 
 	}
 
 	var response struct {
-		CheckpointAt *string `json:"checkpointAt"`
+		CheckpointAt json.RawMessage `json:"checkpointAt"`
 	}
 	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
 		return time.Time{}, false, fmt.Errorf("decode checkpoint: %w", err)
 	}
-	if response.CheckpointAt == nil || strings.TrimSpace(*response.CheckpointAt) == "" {
+	if len(response.CheckpointAt) == 0 {
+		return time.Time{}, false, fmt.Errorf("decode checkpoint: missing checkpointAt")
+	}
+	if bytes.Equal(bytes.TrimSpace(response.CheckpointAt), []byte("null")) {
 		return time.Time{}, false, nil
 	}
-	checkpoint, err := time.ParseInLocation(zkbioTimeLayout, *response.CheckpointAt, zkbioTimeLocation)
+	var checkpointText string
+	if err := json.Unmarshal(response.CheckpointAt, &checkpointText); err != nil {
+		return time.Time{}, false, fmt.Errorf("decode checkpointAt: %w", err)
+	}
+	checkpoint, err := time.ParseInLocation(zkbioTimeLayout, strings.TrimSpace(checkpointText), zkbioTimeLocation)
 	if err != nil {
 		return time.Time{}, false, fmt.Errorf("parse checkpoint: %w", err)
 	}

@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAtoiPtr(t *testing.T) {
@@ -131,5 +133,70 @@ func TestResignWhenFound(t *testing.T) {
 	}
 	if !posted {
 		t.Fatalf("expected POST to /personnel/api/resigns/")
+	}
+}
+
+func TestFetchZKBioTimeCheckpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/agent-bridge/zkbiotime/checkpoint" {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("X-API-Key"); got != "test-key" {
+			t.Fatalf("X-API-Key = %q, want test-key", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"checkpointAt":"2026-07-20 08:30:00"}`)
+	}))
+	defer srv.Close()
+
+	a := &Agent{config: Config{PlamatixURL: srv.URL, APIKey: "test-key"}}
+	got, ok, err := a.fetchZKBioTimeCheckpoint(context.Background())
+	if err != nil {
+		t.Fatalf("fetch checkpoint: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected checkpoint to be present")
+	}
+	want := time.Date(2026, time.July, 20, 8, 30, 0, 0, zkbioTimeLocation)
+	if !got.Equal(want) {
+		t.Fatalf("checkpoint = %s, want %s", got, want)
+	}
+}
+
+func TestRelayZKBioTimeTransactionsIncludesCheckpoint(t *testing.T) {
+	var received struct {
+		Type         string           `json:"type"`
+		CheckpointAt string           `json:"checkpointAt"`
+		Data         []map[string]any `json:"data"`
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/agent-bridge/attlog" {
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+		if got := r.Header.Get("X-API-Key"); got != "test-key" {
+			t.Fatalf("X-API-Key = %q, want test-key", got)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a := &Agent{config: Config{PlamatixURL: srv.URL, APIKey: "test-key"}}
+	checkpoint := time.Date(2026, time.July, 20, 8, 31, 0, 0, zkbioTimeLocation)
+	txns := []map[string]any{{"emp_code": "101", "punch_time": "2026-07-20 08:30:00"}}
+	if err := a.relayZKBioTimeTransactions(context.Background(), txns, checkpoint); err != nil {
+		t.Fatalf("relay transactions: %v", err)
+	}
+
+	if received.Type != "zkbiotime" {
+		t.Fatalf("type = %q, want zkbiotime", received.Type)
+	}
+	if received.CheckpointAt != "2026-07-20 08:31:00" {
+		t.Fatalf("checkpointAt = %q", received.CheckpointAt)
+	}
+	if !reflect.DeepEqual(received.Data, txns) {
+		t.Fatalf("data = %#v, want %#v", received.Data, txns)
 	}
 }

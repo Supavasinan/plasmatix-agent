@@ -17,6 +17,10 @@ import (
 	zk "github.com/Supavasinan/zkbiotime-go"
 )
 
+const zkbioTimeLayout = "2006-01-02 15:04:05"
+
+var zkbioTimeLocation = time.FixedZone("Asia/Bangkok", 7*60*60)
+
 // ZKBioTimeClient talks to a ZKBioTime / BioTime 8 server via the zkbiotime-go
 // SDK. It is used when the agent runs in mode "zkbiotime". Credentials arrive in
 // the generic zkbio_url/username/password config keys.
@@ -290,6 +294,7 @@ func (c *ZKBioTimeClient) fetchAttReport(ctx context.Context, start, end string)
 func (c *ZKBioTimeClient) fetchTransactions(ctx context.Context, start, end string) ([]map[string]any, error) {
 	var all []map[string]any
 	page := 1
+	const maxPages = 200
 	for {
 		q := url.Values{
 			"start_time": {start},
@@ -315,10 +320,10 @@ func (c *ZKBioTimeClient) fetchTransactions(ctx context.Context, start, end stri
 		if out.Next == "" || len(out.Data) == 0 {
 			break
 		}
-		page++
-		if page > 200 { // safety
-			break
+		if page >= maxPages {
+			return nil, fmt.Errorf("GET transactions exceeded %d pages; refusing to acknowledge a partial backlog", maxPages)
 		}
+		page++
 	}
 	return all, nil
 }
@@ -466,39 +471,54 @@ func (a *Agent) cmdZkbiotimeRequest(ctx context.Context, params map[string]strin
 
 // runZKBioTimePollLoop periodically pulls new transactions and relays them to
 // /api/agent-bridge/attlog as {type:"zkbiotime", data:[...]}. A sliding overlap
-// + the server-side natural-key dedup make re-polls idempotent.
+// + the server-side natural-key dedup make re-polls idempotent. The bridge owns
+// the checkpoint so a host restart cannot lose an outage backlog.
 func (a *Agent) runZKBioTimePollLoop(ctx context.Context) {
 	c := a.zkbiotime
 	if c == nil {
 		return
 	}
-	const layout = "2006-01-02 15:04:05"
 	const overlap = 2 * time.Minute
 	const interval = 60 * time.Second
 
-	hwm := time.Now().Add(-24 * time.Hour)
+	var hwm time.Time
+	checkpointLoaded := false
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	pull := func() {
-		now := time.Now()
-		start := hwm.Add(-overlap).Format(layout)
-		end := now.Format(layout)
+		if !checkpointLoaded {
+			checkpoint, ok, err := a.fetchZKBioTimeCheckpoint(ctx)
+			if err != nil {
+				log.Printf("[zkbiotime] fetch checkpoint: %v", err)
+				return
+			}
+			if ok {
+				hwm = checkpoint
+			} else {
+				hwm = time.Now().In(zkbioTimeLocation).Add(-24 * time.Hour)
+			}
+			checkpointLoaded = true
+		}
+
+		now := time.Now().In(zkbioTimeLocation)
+		start := hwm.Add(-overlap).Format(zkbioTimeLayout)
+		end := now.Format(zkbioTimeLayout)
 		txns, err := c.fetchTransactions(ctx, start, end)
 		if err != nil {
 			log.Printf("[zkbiotime] pull transactions: %v", err)
 			return
 		}
-		if len(txns) == 0 {
-			hwm = now
-			return
-		}
-		if err := a.relayZKBioTimeTransactions(ctx, txns); err != nil {
+
+		nextCheckpoint := now
+		if err := a.relayZKBioTimeTransactions(ctx, txns, nextCheckpoint); err != nil {
 			log.Printf("[zkbiotime] relay attlog: %v", err)
 			return
 		}
-		log.Printf("[zkbiotime] relayed %d transactions", len(txns))
-		hwm = now
+		if len(txns) > 0 {
+			log.Printf("[zkbiotime] relayed %d transactions", len(txns))
+		}
+		hwm = nextCheckpoint
 	}
 
 	pull()
@@ -512,8 +532,47 @@ func (a *Agent) runZKBioTimePollLoop(ctx context.Context) {
 	}
 }
 
-func (a *Agent) relayZKBioTimeTransactions(ctx context.Context, txns []map[string]any) error {
-	payload := map[string]any{"type": "zkbiotime", "data": txns}
+func (a *Agent) fetchZKBioTimeCheckpoint(ctx context.Context) (time.Time, bool, error) {
+	checkpointURL := fmt.Sprintf("%s/api/agent-bridge/zkbiotime/checkpoint", a.config.PlamatixURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checkpointURL, nil)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	req.Header.Set("X-API-Key", a.config.APIKey)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(res.Body)
+		return time.Time{}, false, fmt.Errorf("checkpoint HTTP %d: %s", res.StatusCode, truncate(string(body), 200))
+	}
+
+	var response struct {
+		CheckpointAt *string `json:"checkpointAt"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		return time.Time{}, false, fmt.Errorf("decode checkpoint: %w", err)
+	}
+	if response.CheckpointAt == nil || strings.TrimSpace(*response.CheckpointAt) == "" {
+		return time.Time{}, false, nil
+	}
+	checkpoint, err := time.ParseInLocation(zkbioTimeLayout, *response.CheckpointAt, zkbioTimeLocation)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("parse checkpoint: %w", err)
+	}
+	return checkpoint, true, nil
+}
+
+func (a *Agent) relayZKBioTimeTransactions(ctx context.Context, txns []map[string]any, checkpoint time.Time) error {
+	payload := map[string]any{
+		"type":         "zkbiotime",
+		"data":         txns,
+		"checkpointAt": checkpoint.In(zkbioTimeLocation).Format(zkbioTimeLayout),
+	}
 	body, _ := json.Marshal(payload)
 	attURL := fmt.Sprintf("%s/api/agent-bridge/attlog", a.config.PlamatixURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, attURL, bytes.NewReader(body))

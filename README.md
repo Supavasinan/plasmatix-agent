@@ -6,6 +6,7 @@ Standalone agent that runs on machines with access to ZKBio CVAccess. Connects b
 
 - Reverse SSE connection (agent initiates outbound, no inbound ports needed)
 - ZKBio session caching with auto-relogin
+- Durable ZKBioTime sync checkpoints, so an Agent restart resumes from Plasmatix's last acknowledged batch
 - Remote commands: employee sync, attendance transactions, daily/monthly reports
 - Self-update and self-uninstall via remote commands
 - Runs as a native service: systemd on Linux, Service Control Manager on Windows

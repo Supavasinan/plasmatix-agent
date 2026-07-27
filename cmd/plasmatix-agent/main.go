@@ -456,6 +456,15 @@ func (a *Agent) startADMSServer() {
 func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 	sn := r.URL.Query().Get("SN")
 	s.agent.devices.noteContact(sn, r.RemoteAddr)
+	pushVersion := r.URL.Query().Get("pushver")
+	if pushVersion == "" {
+		pushVersion = r.URL.Query().Get("PushVersion")
+	}
+	s.agent.devices.observeProtocol(sn, ProtocolObservation{
+		Path:         r.URL.Path,
+		PushVersion:  pushVersion,
+		Capabilities: capabilitiesFromQuery(r.URL.Query()),
+	})
 	w.Header().Set("Content-Type", "text/plain")
 
 	if r.Method == http.MethodGet {
@@ -845,7 +854,9 @@ func (s *ADMSServer) ackFullSync(sn string) {
 // here on every handshake. Returning RegistryCode keeps the device from
 // looping back into the cdata GET indefinitely.
 func (s *ADMSServer) handleRegistry(w http.ResponseWriter, r *http.Request) {
-	s.agent.devices.noteContact(r.URL.Query().Get("SN"), r.RemoteAddr)
+	sn := r.URL.Query().Get("SN")
+	s.agent.devices.noteContact(sn, r.RemoteAddr)
+	s.agent.devices.observeProtocol(sn, ProtocolObservation{Path: r.URL.Path})
 	w.Header().Set("Content-Type", "text/plain")
 	code := strings.ToUpper(strconv.FormatInt(time.Now().Unix(), 16))
 	fmt.Fprintf(w, "RegistryCode=%s", code)
@@ -854,7 +865,9 @@ func (s *ADMSServer) handleRegistry(w http.ResponseWriter, r *http.Request) {
 // PUSH 3.x devices open this channel for real-time event delivery.
 // Returning push-channel config (not bare OK) prevents reconnect loops.
 func (s *ADMSServer) handlePush(w http.ResponseWriter, r *http.Request) {
-	s.agent.devices.noteContact(r.URL.Query().Get("SN"), r.RemoteAddr)
+	sn := r.URL.Query().Get("SN")
+	s.agent.devices.noteContact(sn, r.RemoteAddr)
+	s.agent.devices.observeProtocol(sn, ProtocolObservation{Path: r.URL.Path})
 	w.Header().Set("Content-Type", "text/plain")
 	fmt.Fprint(w,
 		"ServerVersion=3.1.2\nServerName=ADMS\nPushVersion=3.1.2\n"+

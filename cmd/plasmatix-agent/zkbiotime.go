@@ -19,10 +19,7 @@ import (
 	zk "github.com/Supavasinan/zkbiotime-go"
 )
 
-const zkbioTimeLayout = "2006-01-02 15:04:05"
 const maxSafeJSONInteger int64 = 1<<53 - 1
-
-var zkbioTimeLocation = time.FixedZone("Asia/Bangkok", 7*60*60)
 
 // ZKBioTimeClient talks to a ZKBioTime / BioTime 8 server via the zkbiotime-go
 // SDK. It is used when the agent runs in mode "zkbiotime". Credentials arrive in
@@ -293,59 +290,6 @@ func (c *ZKBioTimeClient) fetchAttReport(ctx context.Context, start, end string)
 	return map[string]any{"count": rep.Count, "data": rep.Data}, nil
 }
 
-// fetchTransactions pulls raw punches in a time window (paginated).
-func (c *ZKBioTimeClient) fetchTransactions(ctx context.Context, start, end string) ([]map[string]any, error) {
-	all := make([]map[string]any, 0)
-	page := 1
-	previousNext := ""
-	const maxPages = 200
-	for {
-		q := url.Values{
-			"start_time": {start},
-			"end_time":   {end},
-			"page":       {strconv.Itoa(page)},
-			"page_size":  {"500"},
-		}
-		code, body, err := c.do(ctx, http.MethodGet, "/iclock/api/transactions/", q, nil)
-		if err != nil {
-			return nil, err
-		}
-		if code != http.StatusOK {
-			return nil, fmt.Errorf("GET transactions (HTTP %d): %s", code, truncate(string(body), 160))
-		}
-		var envelope struct {
-			Next string          `json:"next"`
-			Data json.RawMessage `json:"data"`
-		}
-		if err := json.Unmarshal(body, &envelope); err != nil {
-			return nil, err
-		}
-		if len(envelope.Data) == 0 || bytes.Equal(bytes.TrimSpace(envelope.Data), []byte("null")) {
-			return nil, fmt.Errorf("GET transactions page %d has missing or null data", page)
-		}
-		var pageData []map[string]any
-		if err := json.Unmarshal(envelope.Data, &pageData); err != nil {
-			return nil, fmt.Errorf("decode transactions page %d data: %w", page, err)
-		}
-		if envelope.Next != "" && len(pageData) == 0 {
-			return nil, fmt.Errorf("GET transactions page %d is empty while pagination continues", page)
-		}
-		if envelope.Next != "" && envelope.Next == previousNext {
-			return nil, fmt.Errorf("GET transactions pagination stalled at page %d", page)
-		}
-		all = append(all, pageData...)
-		if envelope.Next == "" {
-			break
-		}
-		if page >= maxPages {
-			return nil, fmt.Errorf("GET transactions exceeded %d pages; refusing to acknowledge a partial backlog", maxPages)
-		}
-		previousNext = envelope.Next
-		page++
-	}
-	return all, nil
-}
-
 func (c *ZKBioTimeClient) fetchTransactionsAfterID(
 	ctx context.Context,
 	cursor int64,
@@ -530,12 +474,11 @@ func (a *Agent) cmdZkbiotimeRequest(ctx context.Context, params map[string]strin
 	return map[string]any{"status": code, "body": parsed}, nil
 }
 
-// ── Transaction poll loop (Phase 0 pull) ─────────────────────────────────────
+// ── Transaction poll loop ────────────────────────────────────────────────────
 
-// runZKBioTimePollLoop periodically pulls new transactions and relays them to
-// /api/agent-bridge/attlog as {type:"zkbiotime", data:[...]}. A sliding overlap
-// + the server-side natural-key dedup make re-polls idempotent. The bridge owns
-// the checkpoint so a host restart cannot lose an outage backlog.
+// runZKBioTimePollLoop periodically catches up from the durable transaction ID
+// acknowledged by the bridge. The cursor only advances after the bridge accepts
+// each batch, so delayed punches and retries cannot create permanent gaps.
 func (a *Agent) runZKBioTimePollLoop(ctx context.Context) {
 	c := a.zkbiotime
 	if c == nil {
@@ -543,33 +486,28 @@ func (a *Agent) runZKBioTimePollLoop(ctx context.Context) {
 	}
 	const interval = 60 * time.Second
 
-	var hwm time.Time
-	checkpointLoaded := false
+	var cursor int64
+	cursorLoaded := false
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	pull := func() {
-		if !checkpointLoaded {
-			checkpoint, ok, err := a.fetchZKBioTimeCheckpoint(ctx)
+		if !cursorLoaded {
+			lastTransactionID, err := a.fetchZKBioTimeLastTransactionID(ctx)
 			if err != nil {
-				log.Printf("[zkbiotime] fetch checkpoint: %v", err)
+				log.Printf("[zkbiotime] fetch transaction cursor: %v", err)
 				return
 			}
-			if ok {
-				hwm = checkpoint
-			} else {
-				hwm = time.Now().In(zkbioTimeLocation).Add(-24 * time.Hour)
-			}
-			checkpointLoaded = true
+			cursor = lastTransactionID
+			cursorLoaded = true
 		}
 
-		requestEnd := time.Now().In(zkbioTimeLocation)
-		nextCheckpoint, err := a.pullZKBioTimeTransactions(ctx, c, hwm, requestEnd)
+		nextCursor, err := a.catchUpZKBioTimeTransactions(ctx, c, cursor)
 		if err != nil {
-			log.Printf("[zkbiotime] pull window: %v", err)
+			log.Printf("[zkbiotime] catch up transactions: %v", err)
 			return
 		}
-		hwm = nextCheckpoint
+		cursor = nextCursor
 	}
 
 	pull()
@@ -581,27 +519,6 @@ func (a *Agent) runZKBioTimePollLoop(ctx context.Context) {
 			pull()
 		}
 	}
-}
-
-func nextZKBioTimeCheckpoint(txns []map[string]any, requestEnd time.Time) time.Time {
-	var next time.Time
-	for _, txn := range txns {
-		uploadTime, ok := txn["upload_time"].(string)
-		if !ok {
-			continue
-		}
-		parsed, err := time.ParseInLocation(zkbioTimeLayout, strings.TrimSpace(uploadTime), zkbioTimeLocation)
-		if err != nil {
-			continue
-		}
-		if next.IsZero() || parsed.After(next) {
-			next = parsed
-		}
-	}
-	if next.IsZero() {
-		return requestEnd
-	}
-	return next
 }
 
 func zkbioTransactionID(row map[string]any) (int64, error) {
@@ -647,23 +564,35 @@ func prepareZKBioTimeBatch(
 	return newer, next, nil
 }
 
-func (a *Agent) pullZKBioTimeTransactions(ctx context.Context, c *ZKBioTimeClient, hwm, requestEnd time.Time) (time.Time, error) {
-	const overlap = 2 * time.Minute
-	start := hwm.In(zkbioTimeLocation).Add(-overlap).Format(zkbioTimeLayout)
-	end := requestEnd.In(zkbioTimeLocation).Format(zkbioTimeLayout)
-	txns, err := c.fetchTransactions(ctx, start, end)
-	if err != nil {
-		return hwm, fmt.Errorf("pull transactions: %w", err)
-	}
+func (a *Agent) catchUpZKBioTimeTransactions(
+	ctx context.Context,
+	c *ZKBioTimeClient,
+	cursor int64,
+) (int64, error) {
+	for {
+		rows, err := c.fetchTransactionsAfterID(ctx, cursor)
+		if err != nil {
+			return cursor, fmt.Errorf("pull transactions after ID %d: %w", cursor, err)
+		}
 
-	nextCheckpoint := nextZKBioTimeCheckpoint(txns, requestEnd)
-	if err := a.relayZKBioTimeTransactions(ctx, txns, nextCheckpoint); err != nil {
-		return hwm, fmt.Errorf("relay attlog: %w", err)
+		txns, nextCursor, err := prepareZKBioTimeBatch(rows, cursor)
+		if err != nil {
+			return cursor, fmt.Errorf("prepare transactions after ID %d: %w", cursor, err)
+		}
+		if len(txns) == 0 {
+			return cursor, nil
+		}
+
+		if err := a.relayZKBioTimeTransactions(ctx, txns, nextCursor); err != nil {
+			return cursor, fmt.Errorf("relay attlog through ID %d: %w", nextCursor, err)
+		}
+		log.Printf(
+			"[zkbiotime] relayed %d transactions through ID %d",
+			len(txns),
+			nextCursor,
+		)
+		cursor = nextCursor
 	}
-	if len(txns) > 0 {
-		log.Printf("[zkbiotime] relayed %d transactions", len(txns))
-	}
-	return nextCheckpoint, nil
 }
 
 func (a *Agent) fetchZKBioTimeLastTransactionID(ctx context.Context) (int64, error) {
@@ -708,53 +637,11 @@ func (a *Agent) fetchZKBioTimeLastTransactionID(ctx context.Context) (int64, err
 	return cursor, nil
 }
 
-func (a *Agent) fetchZKBioTimeCheckpoint(ctx context.Context) (time.Time, bool, error) {
-	checkpointURL := fmt.Sprintf("%s/api/agent-bridge/zkbiotime/checkpoint", a.config.PlamatixURL)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checkpointURL, nil)
-	if err != nil {
-		return time.Time{}, false, err
-	}
-	req.Header.Set("X-API-Key", a.config.APIKey)
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	res, err := client.Do(req)
-	if err != nil {
-		return time.Time{}, false, err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(res.Body)
-		return time.Time{}, false, fmt.Errorf("checkpoint HTTP %d: %s", res.StatusCode, truncate(string(body), 200))
-	}
-
-	var response struct {
-		CheckpointAt json.RawMessage `json:"checkpointAt"`
-	}
-	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
-		return time.Time{}, false, fmt.Errorf("decode checkpoint: %w", err)
-	}
-	if len(response.CheckpointAt) == 0 {
-		return time.Time{}, false, fmt.Errorf("decode checkpoint: missing checkpointAt")
-	}
-	if bytes.Equal(bytes.TrimSpace(response.CheckpointAt), []byte("null")) {
-		return time.Time{}, false, nil
-	}
-	var checkpointText string
-	if err := json.Unmarshal(response.CheckpointAt, &checkpointText); err != nil {
-		return time.Time{}, false, fmt.Errorf("decode checkpointAt: %w", err)
-	}
-	checkpoint, err := time.ParseInLocation(zkbioTimeLayout, strings.TrimSpace(checkpointText), zkbioTimeLocation)
-	if err != nil {
-		return time.Time{}, false, fmt.Errorf("parse checkpoint: %w", err)
-	}
-	return checkpoint, true, nil
-}
-
-func (a *Agent) relayZKBioTimeTransactions(ctx context.Context, txns []map[string]any, checkpoint time.Time) error {
+func (a *Agent) relayZKBioTimeTransactions(ctx context.Context, txns []map[string]any, lastTransactionID int64) error {
 	payload := map[string]any{
-		"type":         "zkbiotime",
-		"data":         txns,
-		"checkpointAt": checkpoint.In(zkbioTimeLocation).Format(zkbioTimeLayout),
+		"type":              "zkbiotime",
+		"data":              txns,
+		"lastTransactionId": lastTransactionID,
 	}
 	body, _ := json.Marshal(payload)
 	attURL := fmt.Sprintf("%s/api/agent-bridge/attlog", a.config.PlamatixURL)

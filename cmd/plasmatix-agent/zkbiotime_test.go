@@ -9,7 +9,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestAtoiPtr(t *testing.T) {
@@ -133,62 +132,6 @@ func TestResignWhenFound(t *testing.T) {
 	}
 	if !posted {
 		t.Fatalf("expected POST to /personnel/api/resigns/")
-	}
-}
-
-func TestFetchZKBioTimeCheckpoint(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/api/agent-bridge/zkbiotime/checkpoint" {
-			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
-		}
-		if got := r.Header.Get("X-API-Key"); got != "test-key" {
-			t.Fatalf("X-API-Key = %q, want test-key", got)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"checkpointAt":"2026-07-20 08:30:00"}`)
-	}))
-	defer srv.Close()
-
-	a := &Agent{config: Config{PlamatixURL: srv.URL, APIKey: "test-key"}}
-	got, ok, err := a.fetchZKBioTimeCheckpoint(context.Background())
-	if err != nil {
-		t.Fatalf("fetch checkpoint: %v", err)
-	}
-	if !ok {
-		t.Fatal("expected checkpoint to be present")
-	}
-	want := time.Date(2026, time.July, 20, 8, 30, 0, 0, zkbioTimeLocation)
-	if !got.Equal(want) {
-		t.Fatalf("checkpoint = %s, want %s", got, want)
-	}
-}
-
-func TestFetchZKBioTimeCheckpointDistinguishesNullFromAbsent(t *testing.T) {
-	tests := []struct {
-		name    string
-		body    string
-		wantErr bool
-	}{
-		{name: "explicit null", body: `{"checkpointAt":null}`},
-		{name: "absent field", body: `{}`, wantErr: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				io.WriteString(w, tt.body)
-			}))
-			defer srv.Close()
-
-			a := &Agent{config: Config{PlamatixURL: srv.URL, APIKey: "test-key"}}
-			_, ok, err := a.fetchZKBioTimeCheckpoint(context.Background())
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("fetch checkpoint error = %v, wantErr %v", err, tt.wantErr)
-			}
-			if !tt.wantErr && ok {
-				t.Fatal("explicit null checkpoint should be accepted as absent")
-			}
-		})
 	}
 }
 
@@ -342,162 +285,11 @@ func TestPrepareZKBioTimeBatchRejectsInvalidIDs(t *testing.T) {
 	}
 }
 
-func TestNextZKBioTimeCheckpointUsesGreatestParseableUploadTime(t *testing.T) {
-	requestEnd := time.Date(2026, time.July, 20, 9, 0, 0, 0, zkbioTimeLocation)
-	txns := []map[string]any{
-		{"upload_time": "2026-07-20 08:41:00"},
-		{"upload_time": "not-a-time"},
-		{"upload_time": "2026-07-20 08:52:00"},
-		{"upload_time": "2026-07-20 08:47:00"},
-		{"upload_time": 12345},
-	}
-
-	got := nextZKBioTimeCheckpoint(txns, requestEnd)
-	want := time.Date(2026, time.July, 20, 8, 52, 0, 0, zkbioTimeLocation)
-	if !got.Equal(want) {
-		t.Fatalf("checkpoint = %s, want greatest upload_time %s", got, want)
-	}
-}
-
-func TestNextZKBioTimeCheckpointFallsBackToRequestEnd(t *testing.T) {
-	requestEnd := time.Date(2026, time.July, 20, 9, 0, 0, 0, zkbioTimeLocation)
-	txns := []map[string]any{{"upload_time": "not-a-time"}}
-
-	if got := nextZKBioTimeCheckpoint(txns, requestEnd); !got.Equal(requestEnd) {
-		t.Fatalf("checkpoint = %s, want request end %s", got, requestEnd)
-	}
-	if got := nextZKBioTimeCheckpoint(nil, requestEnd); !got.Equal(requestEnd) {
-		t.Fatalf("empty batch checkpoint = %s, want request end %s", got, requestEnd)
-	}
-}
-
-func TestPullZKBioTimeTransactionsAcknowledgesEmptyBatch(t *testing.T) {
-	zkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"next":null,"data":[]}`)
-	}))
-	defer zkServer.Close()
-
+func TestRelayZKBioTimeTransactionsIncludesID(t *testing.T) {
 	var received struct {
-		CheckpointAt string           `json:"checkpointAt"`
-		Data         []map[string]any `json:"data"`
-	}
-	relayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
-			t.Fatalf("decode relay: %v", err)
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer relayServer.Close()
-
-	a := &Agent{config: Config{PlamatixURL: relayServer.URL, APIKey: "test-key"}}
-	c := newZKBioTimeClientWith(zkServer.URL, "x", "x", zkServer.Client())
-	prior := time.Date(2026, time.July, 20, 8, 0, 0, 0, zkbioTimeLocation)
-	requestEnd := time.Date(2026, time.July, 20, 9, 0, 0, 0, zkbioTimeLocation)
-
-	got, err := a.pullZKBioTimeTransactions(context.Background(), c, prior, requestEnd)
-	if err != nil {
-		t.Fatalf("pull: %v", err)
-	}
-	if !got.Equal(requestEnd) {
-		t.Fatalf("checkpoint = %s, want request end %s", got, requestEnd)
-	}
-	if received.CheckpointAt != "2026-07-20 09:00:00" {
-		t.Fatalf("relayed checkpointAt = %q", received.CheckpointAt)
-	}
-	if received.Data == nil || len(received.Data) != 0 {
-		t.Fatalf("relayed data = %#v, want empty JSON array", received.Data)
-	}
-}
-
-func TestPullZKBioTimeTransactionsRelayFailurePreservesCheckpoint(t *testing.T) {
-	zkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"next":null,"data":[{"upload_time":"2026-07-20 08:45:00"}]}`)
-	}))
-	defer zkServer.Close()
-	relayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "retry later", http.StatusBadGateway)
-	}))
-	defer relayServer.Close()
-
-	a := &Agent{config: Config{PlamatixURL: relayServer.URL, APIKey: "test-key"}}
-	c := newZKBioTimeClientWith(zkServer.URL, "x", "x", zkServer.Client())
-	prior := time.Date(2026, time.July, 20, 8, 0, 0, 0, zkbioTimeLocation)
-	requestEnd := time.Date(2026, time.July, 20, 9, 0, 0, 0, zkbioTimeLocation)
-
-	got, err := a.pullZKBioTimeTransactions(context.Background(), c, prior, requestEnd)
-	if err == nil {
-		t.Fatal("expected relay error")
-	}
-	if !got.Equal(prior) {
-		t.Fatalf("checkpoint = %s after relay failure, want prior %s", got, prior)
-	}
-}
-
-func TestFetchTransactionsFailsClosedOnInvalidPagination(t *testing.T) {
-	tests := []struct {
-		name    string
-		handler http.HandlerFunc
-	}{
-		{
-			name: "missing data",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				io.WriteString(w, `{"next":null}`)
-			},
-		},
-		{
-			name: "null data",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				io.WriteString(w, `{"next":null,"data":null}`)
-			},
-		},
-		{
-			name: "continuing page is empty",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Query().Get("page") == "1" {
-					io.WriteString(w, `{"next":"?page=2","data":[{"id":1}]}`)
-					return
-				}
-				io.WriteString(w, `{"next":"?page=3","data":[]}`)
-			},
-		},
-		{
-			name: "continuing page is stalled",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				io.WriteString(w, `{"next":"?page=2","data":[{"id":1}]}`)
-			},
-		},
-		{
-			name: "next remains at page cap",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				io.WriteString(w, `{"next":"?page=`+r.URL.Query().Get("page")+`","data":[{"id":1}]}`)
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			srv := httptest.NewServer(tt.handler)
-			defer srv.Close()
-			c := newZKBioTimeClientWith(srv.URL, "x", "x", srv.Client())
-
-			got, err := c.fetchTransactions(context.Background(), "2026-07-20 08:00:00", "2026-07-20 09:00:00")
-			if err == nil {
-				t.Fatal("expected pagination error")
-			}
-			if got != nil {
-				t.Fatalf("partial data returned on pagination failure: %#v", got)
-			}
-		})
-	}
-}
-
-func TestRelayZKBioTimeTransactionsIncludesCheckpoint(t *testing.T) {
-	var received struct {
-		Type         string           `json:"type"`
-		CheckpointAt string           `json:"checkpointAt"`
-		Data         []map[string]any `json:"data"`
+		Type              string           `json:"type"`
+		LastTransactionID int64            `json:"lastTransactionId"`
+		Data              []map[string]any `json:"data"`
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/agent-bridge/attlog" {
@@ -514,19 +306,97 @@ func TestRelayZKBioTimeTransactionsIncludesCheckpoint(t *testing.T) {
 	defer srv.Close()
 
 	a := &Agent{config: Config{PlamatixURL: srv.URL, APIKey: "test-key"}}
-	checkpoint := time.Date(2026, time.July, 20, 8, 31, 0, 0, zkbioTimeLocation)
-	txns := []map[string]any{{"emp_code": "101", "punch_time": "2026-07-20 08:30:00"}}
-	if err := a.relayZKBioTimeTransactions(context.Background(), txns, checkpoint); err != nil {
+	txns := []map[string]any{{"id": float64(173), "emp_code": "101", "punch_time": "2026-07-20 08:30:00"}}
+	if err := a.relayZKBioTimeTransactions(context.Background(), txns, 173); err != nil {
 		t.Fatalf("relay transactions: %v", err)
 	}
 
 	if received.Type != "zkbiotime" {
 		t.Fatalf("type = %q, want zkbiotime", received.Type)
 	}
-	if received.CheckpointAt != "2026-07-20 08:31:00" {
-		t.Fatalf("checkpointAt = %q", received.CheckpointAt)
+	if received.LastTransactionID != 173 {
+		t.Fatalf("lastTransactionId = %d, want 173", received.LastTransactionID)
 	}
 	if !reflect.DeepEqual(received.Data, txns) {
 		t.Fatalf("data = %#v, want %#v", received.Data, txns)
+	}
+}
+
+func TestCatchUpZKBioTimeTransactionsAdvancesAcrossBatches(t *testing.T) {
+	zkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch got := r.URL.Query().Get("last_id"); got {
+		case "172":
+			io.WriteString(w, `{"data":[{"id":174},{"id":173}]}`)
+		case "174":
+			io.WriteString(w, `{"data":[{"id":175}]}`)
+		case "175":
+			io.WriteString(w, `{"data":[]}`)
+		default:
+			t.Fatalf("unexpected last_id %q", got)
+		}
+	}))
+	defer zkServer.Close()
+
+	var acknowledged []int64
+	relayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			LastTransactionID int64 `json:"lastTransactionId"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode relay: %v", err)
+		}
+		acknowledged = append(acknowledged, payload.LastTransactionID)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer relayServer.Close()
+
+	a := &Agent{config: Config{PlamatixURL: relayServer.URL, APIKey: "test-key"}}
+	c := newZKBioTimeClientWith(zkServer.URL, "x", "x", zkServer.Client())
+	got, err := a.catchUpZKBioTimeTransactions(context.Background(), c, 172)
+	if err != nil {
+		t.Fatalf("catch up: %v", err)
+	}
+	if got != 175 {
+		t.Fatalf("cursor = %d, want 175", got)
+	}
+	if !reflect.DeepEqual(acknowledged, []int64{174, 175}) {
+		t.Fatalf("acknowledged = %#v, want [174 175]", acknowledged)
+	}
+}
+
+func TestCatchUpZKBioTimeTransactionsRelayFailurePreservesAcknowledgedID(t *testing.T) {
+	zkServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Query().Get("last_id") {
+		case "172":
+			io.WriteString(w, `{"data":[{"id":173},{"id":174}]}`)
+		case "174":
+			io.WriteString(w, `{"data":[{"id":175}]}`)
+		default:
+			io.WriteString(w, `{"data":[]}`)
+		}
+	}))
+	defer zkServer.Close()
+
+	relayCalls := 0
+	relayServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		relayCalls++
+		if relayCalls == 2 {
+			http.Error(w, "retry later", http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer relayServer.Close()
+
+	a := &Agent{config: Config{PlamatixURL: relayServer.URL, APIKey: "test-key"}}
+	c := newZKBioTimeClientWith(zkServer.URL, "x", "x", zkServer.Client())
+	got, err := a.catchUpZKBioTimeTransactions(context.Background(), c, 172)
+	if err == nil {
+		t.Fatal("expected relay error")
+	}
+	if got != 174 {
+		t.Fatalf("cursor = %d after relay failure, want 174", got)
 	}
 }

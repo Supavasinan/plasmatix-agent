@@ -36,6 +36,7 @@ type Config struct {
 	ZKBioURL      string
 	ZKBioUsername string
 	ZKBioPassword string
+	MigrationDSN  string
 	Port          int
 	Mode          string
 	ADMSPort      int
@@ -293,6 +294,7 @@ func loadConfig(path string) (Config, error) {
 		ZKBioURL      string `json:"zkbio_url"`
 		ZKBioUsername string `json:"zkbio_username"`
 		ZKBioPassword string `json:"zkbio_password"`
+		MigrationDSN  string `json:"migration_dsn"`
 		Port          int    `json:"port"`
 		Mode          string `json:"mode"`
 		ADMSPort      int    `json:"adms_port"`
@@ -306,6 +308,7 @@ func loadConfig(path string) (Config, error) {
 			ZKBioURL:      jc.ZKBioURL,
 			ZKBioUsername: jc.ZKBioUsername,
 			ZKBioPassword: jc.ZKBioPassword,
+			MigrationDSN:  jc.MigrationDSN,
 			Port:          jc.Port,
 			Mode:          jc.Mode,
 			ADMSPort:      jc.ADMSPort,
@@ -354,6 +357,7 @@ func loadConfig(path string) (Config, error) {
 		ZKBioURL:      parsed["zkbio_url"],
 		ZKBioUsername: parsed["zkbio_username"],
 		ZKBioPassword: parsed["zkbio_password"],
+		MigrationDSN:  parsed["migration_dsn"],
 		Port:          port,
 		Mode:          parsed["mode"],
 		ADMSPort:      admsPort,
@@ -366,6 +370,7 @@ func normalizeConfig(cfg Config) (Config, error) {
 	cfg.ZKBioURL = strings.TrimRight(strings.TrimSpace(cfg.ZKBioURL), "/")
 	cfg.ZKBioUsername = strings.TrimSpace(cfg.ZKBioUsername)
 	cfg.ZKBioPassword = strings.TrimSpace(cfg.ZKBioPassword)
+	cfg.MigrationDSN = strings.TrimSpace(cfg.MigrationDSN)
 	cfg.Mode = strings.ToLower(strings.TrimSpace(cfg.Mode))
 	if cfg.Port == 0 {
 		cfg.Port = 9800
@@ -1516,6 +1521,48 @@ func (a *Agent) handleCommand(requestId, command string, params map[string]strin
 		}
 	case "zkbiotime_request":
 		result, cmdErr = a.cmdZkbiotimeRequest(ctx, params)
+	case "migration_preflight":
+		if a.config.MigrationDSN == "" {
+			cmdErr = fmt.Errorf("migration_dsn is not configured locally")
+		} else {
+			result, cmdErr = NewZKBioTimePostgresSource(
+				a.config.MigrationDSN,
+			).Preflight(ctx)
+		}
+	case "migration_inventory":
+		if a.config.MigrationDSN == "" {
+			cmdErr = fmt.Errorf("migration_dsn is not configured locally")
+		} else {
+			result, cmdErr = NewZKBioTimePostgresSource(
+				a.config.MigrationDSN,
+			).Inventory(ctx)
+		}
+	case "migration_read_batch":
+		if a.config.MigrationDSN == "" {
+			cmdErr = fmt.Errorf("migration_dsn is not configured locally")
+		} else {
+			afterID, parseErr := strconv.ParseInt(params["afterId"], 10, 64)
+			if params["afterId"] == "" {
+				afterID = 0
+				parseErr = nil
+			}
+			limit := atoiOrZero(params["limit"])
+			if limit == 0 {
+				limit = 500
+			}
+			if parseErr != nil {
+				cmdErr = fmt.Errorf("invalid afterId")
+			} else {
+				result, cmdErr = NewZKBioTimePostgresSource(
+					a.config.MigrationDSN,
+				).ReadBatch(
+					ctx,
+					EntityType(params["entity"]),
+					BatchCursor{AfterID: afterID},
+					limit,
+				)
+			}
+		}
 	case "wake_device":
 		if a.adms == nil {
 			cmdErr = fmt.Errorf("ADMS server not running")

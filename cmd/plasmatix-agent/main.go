@@ -900,11 +900,34 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	cmd := queue[0]
 	s.cmdQueue[sn] = queue[1:]
-	s.pendingCmd[cmd.ID] = cmd
 	s.mu.Unlock()
 
+	protocol, _ := s.agent.devices.protocolState(sn)
+	decision := RenderDeviceCommand(protocol, cmd.Command)
+	if decision.Action == CommandRefused {
+		s.mu.Lock()
+		if cmd.CloudID != "" {
+			delete(s.cloudCmdID, cmd.CloudID)
+		}
+		s.mu.Unlock()
+		log.Printf("[ADMS] Refused command for SN=%s localID=%d cloudID=%s reason=%q",
+			sn, cmd.ID, cmd.CloudID, decision.Reason)
+		if cmd.CloudID != "" {
+			go s.reportCloudCommandResult(cmd.CloudID, -2, decision.Reason)
+		}
+		fmt.Fprint(w, "OK")
+		return
+	}
+
+	s.mu.Lock()
+	s.pendingCmd[cmd.ID] = cmd
+	s.mu.Unlock()
+	if decision.Action == CommandTranslated {
+		log.Printf("[ADMS] Translated command for SN=%s localID=%d cloudID=%s reason=%q",
+			sn, cmd.ID, cmd.CloudID, decision.Reason)
+	}
 	log.Printf("[ADMS] Serving command to SN=%s localID=%d cloudID=%s label=%q", sn, cmd.ID, cmd.CloudID, cmd.Label)
-	fmt.Fprintf(w, "C:%d:%s", cmd.ID, cmd.Command)
+	fmt.Fprintf(w, "C:%d:%s", cmd.ID, decision.Rendered)
 }
 
 func (s *ADMSServer) enqueueCommand(sn, command string) int {

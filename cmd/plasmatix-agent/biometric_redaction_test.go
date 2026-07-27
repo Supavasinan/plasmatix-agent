@@ -55,3 +55,38 @@ func TestBiometricRedactionConsumesSpaceSplitBase64Suffix(t *testing.T) {
 		t.Fatalf("redaction removed the next delimited field: %q", got)
 	}
 }
+
+func TestBiometricRedactionFailsClosedForMalformedAndNonStringJSON(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "unterminated string",
+			input: `{"template":"QUJDRA==`,
+		},
+		{
+			name:  "escaped quote",
+			input: `{"template":"QUJ\"DRA==","note":"safe"}`,
+		},
+		{
+			name:  "non-string biometric field",
+			input: `{"template":{"raw":"QUJDRA=="}}`,
+		},
+		{
+			name:  "malformed object",
+			input: `{"template":"QUJDRA==","broken":}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := RedactBiometricText(tt.input)
+			for _, secret := range []string{"QUJDRA==", `QUJ\"DRA==`, "DRA=="} {
+				if strings.Contains(got, secret) {
+					t.Fatalf("redacted text retained biometric material: %q", got)
+				}
+			}
+		})
+	}
+}

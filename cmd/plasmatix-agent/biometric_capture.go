@@ -21,6 +21,7 @@ const (
 	maxFaceTemplateBytes         = 1024 * 1024
 	maxFacePhotoBytes            = 5 * 1024 * 1024
 	maxBiometricAssetsPerRequest = 64
+	maxBiometricAlgorithmVersion = 255
 )
 
 var ErrBiometricVaultDisabled = errors.New("biometric vault disabled")
@@ -64,7 +65,7 @@ func (asset CapturedBiometricAsset) SafeMetadata() BiometricSafeMetadata {
 		AlgorithmFamily: asset.AlgorithmFamily,
 		AlgorithmMajor:  asset.AlgorithmMajor,
 		AlgorithmMinor:  asset.AlgorithmMinor,
-		AssetFormat:     asset.AssetFormat,
+		AssetFormat:     canonicalCapturedAssetFormat(asset),
 		ByteCount:       len(asset.Bytes),
 		SHA256:          hex.EncodeToString(sum[:]),
 	}
@@ -150,10 +151,7 @@ func extractBiometricAsset(
 		encoded = biometricField(fields, "tmp", "template")
 		limit = maxFingerprintTemplateBytes
 		family, major, minor = biometricAlgorithm("finger", fields, state)
-		format = biometricField(fields, "format")
-		if format == "" && major >= 0 {
-			format = "templatev" + strconv.Itoa(major)
-		}
+		format = canonicalBiometricFormat("finger", major)
 	case "BIODATA":
 		var err error
 		bioType, err = requiredBiometricInt(fields, 1, 9, "type")
@@ -168,18 +166,16 @@ func extractBiometricAsset(
 			return CapturedBiometricAsset{}, false, err
 		}
 		encoded = biometricField(fields, "tmp", "template")
-		format = biometricField(fields, "format")
 		if bioType == 1 {
 			assetKind = "fingerprint_template"
 			limit = maxFingerprintTemplateBytes
 			family, major, minor = biometricAlgorithm("finger", fields, state)
+			format = canonicalBiometricFormat("finger", major)
 		} else {
 			assetKind = "face_template"
 			limit = maxFaceTemplateBytes
 			family, major, minor = biometricAlgorithm("face", fields, state)
-		}
-		if format == "" && major >= 0 {
-			format = "templatev" + strconv.Itoa(major)
+			format = canonicalBiometricFormat("face", major)
 		}
 	case "BIOPHOTO":
 		var err error
@@ -285,17 +281,106 @@ func biometricAlgorithm(
 	fields map[string]string,
 	state DeviceProtocolState,
 ) (string, int, int) {
-	major, majorOK := nonNegativeInt(biometricField(fields, "majorver", "algorithmmajor"))
-	minor, minorOK := nonNegativeInt(biometricField(fields, "minorver", "algorithmminor"))
-	if !majorOK || !minorOK {
-		capability := state.Capabilities[modality+"algorithmversion"]
-		major, minor, majorOK = algorithmVersion(capability)
-		minorOK = majorOK
+	major, majorPresent, majorOK := boundedBiometricVersionField(
+		fields,
+		1,
+		"majorver",
+		"algorithmmajor",
+	)
+	minor, minorPresent, minorOK := boundedBiometricVersionField(
+		fields,
+		0,
+		"minorver",
+		"algorithmminor",
+	)
+
+	capability, capabilityPresent := state.Capabilities[modality+"algorithmversion"]
+	capabilityMajor, capabilityMinor, capabilityOK := boundedBiometricAlgorithmVersion(capability)
+
+	if !majorPresent && !minorPresent {
+		if !capabilityPresent || !capabilityOK {
+			return "unknown", -1, -1
+		}
+		major, minor = capabilityMajor, capabilityMinor
+	} else {
+		if !majorPresent || !minorPresent || !majorOK || !minorOK {
+			return "unknown", -1, -1
+		}
+		if capabilityPresent &&
+			(!capabilityOK || major != capabilityMajor || minor != capabilityMinor) {
+			return "unknown", -1, -1
+		}
 	}
-	if !majorOK || !minorOK {
-		return "unknown", -1, -1
-	}
+
 	return "zk" + modality + "-v" + strconv.Itoa(major), major, minor
+}
+
+func boundedBiometricVersionField(
+	fields map[string]string,
+	minimum int,
+	keys ...string,
+) (int, bool, bool) {
+	var raw string
+	present := false
+	for _, key := range keys {
+		value, ok := fields[strings.ToLower(key)]
+		if !ok {
+			continue
+		}
+		if present {
+			return 0, true, false
+		}
+		raw = strings.TrimSpace(value)
+		present = true
+	}
+	if !present {
+		return 0, false, false
+	}
+	value, err := strconv.Atoi(raw)
+	return value, true, err == nil &&
+		value >= minimum &&
+		value <= maxBiometricAlgorithmVersion
+}
+
+func boundedBiometricAlgorithmVersion(value string) (int, int, bool) {
+	major, minor, ok := algorithmVersion(value)
+	return major, minor, ok &&
+		major <= maxBiometricAlgorithmVersion &&
+		minor <= maxBiometricAlgorithmVersion
+}
+
+func canonicalBiometricFormat(modality string, major int) string {
+	if major < 1 || major > maxBiometricAlgorithmVersion {
+		return "unknown"
+	}
+	switch modality {
+	case "finger":
+		return "templatev" + strconv.Itoa(major)
+	case "face":
+		return "facev" + strconv.Itoa(major)
+	default:
+		return "unknown"
+	}
+}
+
+func canonicalCapturedAssetFormat(asset CapturedBiometricAsset) string {
+	switch asset.AssetKind {
+	case "fingerprint_template":
+		return canonicalBiometricFormat("finger", asset.AlgorithmMajor)
+	case "face_template":
+		return canonicalBiometricFormat("face", asset.AlgorithmMajor)
+	case "face_comparison_photo":
+		switch strings.ToLower(strings.TrimSpace(asset.AssetFormat)) {
+		case "jpeg":
+			return "jpeg"
+		case "png":
+			return "png"
+		default:
+			return "unknown"
+		}
+	default:
+		return "unknown"
+	}
 }
 
 func decodeBoundedBiometric(encoded string, limit int) ([]byte, error) {
@@ -398,7 +483,7 @@ func (agent *Agent) UploadBiometricAsset(
 	request.Header.Set("X-Algorithm-Family", asset.AlgorithmFamily)
 	request.Header.Set("X-Algorithm-Major", strconv.Itoa(asset.AlgorithmMajor))
 	request.Header.Set("X-Algorithm-Minor", strconv.Itoa(asset.AlgorithmMinor))
-	request.Header.Set("X-Asset-Format", asset.AssetFormat)
+	request.Header.Set("X-Asset-Format", canonicalCapturedAssetFormat(asset))
 	request.Header.Set("X-Capture-Command-ID", sanitizeHeaderValue(asset.CaptureCommandID))
 
 	response, err := cloudHTTPClient(30 * time.Second).Do(request)
@@ -411,6 +496,7 @@ func (agent *Agent) UploadBiometricAsset(
 	if readErr != nil {
 		return fmt.Errorf("read biometric vault response: %w", readErr)
 	}
+	defer zeroBytes(responseBody)
 	if response.StatusCode >= 200 && response.StatusCode < 300 {
 		return nil
 	}
@@ -424,9 +510,5 @@ func (agent *Agent) UploadBiometricAsset(
 		}
 	}
 
-	detail := strings.TrimSpace(RedactBiometricText(string(responseBody)))
-	if detail == "" {
-		return fmt.Errorf("biometric vault capture failed: HTTP %d", response.StatusCode)
-	}
-	return fmt.Errorf("biometric vault capture failed: HTTP %d: %s", response.StatusCode, detail)
+	return fmt.Errorf("biometric vault capture failed: HTTP %d", response.StatusCode)
 }

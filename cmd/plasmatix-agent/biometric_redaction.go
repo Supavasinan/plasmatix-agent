@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"regexp"
 	"strconv"
 	"strings"
@@ -11,14 +12,31 @@ var (
 	biometricEqualsField = regexp.MustCompile(
 		`(?i)\b(?:tmp|template|photo|photo[_-]?base64|base64[_-]?photo|biophoto)=([^\t\r\n&]+)`,
 	)
-	biometricJSONField = regexp.MustCompile(
-		`(?i)"(?:tmp|template|photo|photo[_-]?base64|base64[_-]?photo|biophoto)"\s*:\s*"([^"]*)"`,
-	)
 )
 
 func RedactBiometricText(value string) string {
-	value = biometricEqualsField.ReplaceAllStringFunc(value, redactEqualsBiometricField)
-	return biometricJSONField.ReplaceAllStringFunc(value, redactJSONBiometricField)
+	lines := strings.Split(value, "\n")
+	for index, line := range lines {
+		lines[index] = redactBiometricLine(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func redactBiometricLine(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		var decoded any
+		if json.Unmarshal([]byte(trimmed), &decoded) != nil {
+			return "[REDACTED:MALFORMED_JSON]"
+		}
+		redactBiometricJSONValue(decoded)
+		redacted, err := json.Marshal(decoded)
+		if err != nil {
+			return "[REDACTED:JSON]"
+		}
+		return string(redacted)
+	}
+	return biometricEqualsField.ReplaceAllStringFunc(value, redactEqualsBiometricField)
 }
 
 func redactEqualsBiometricField(field string) string {
@@ -29,15 +47,35 @@ func redactEqualsBiometricField(field string) string {
 	return key + "=" + redactedBiometricValue(encoded)
 }
 
-func redactJSONBiometricField(field string) string {
-	colon := strings.IndexByte(field, ':')
-	if colon < 0 {
-		return field
+func redactBiometricJSONValue(value any) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, fieldValue := range typed {
+			if isBiometricFieldName(key) {
+				if encoded, ok := fieldValue.(string); ok {
+					typed[key] = redactedBiometricValue(encoded)
+				} else {
+					typed[key] = "[REDACTED]"
+				}
+				continue
+			}
+			redactBiometricJSONValue(fieldValue)
+		}
+	case []any:
+		for _, item := range typed {
+			redactBiometricJSONValue(item)
+		}
 	}
-	prefix := field[:colon+1]
-	encoded := strings.TrimSpace(field[colon+1:])
-	encoded = strings.Trim(encoded, `"`)
-	return prefix + `"` + redactedBiometricValue(encoded) + `"`
+}
+
+func isBiometricFieldName(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "tmp", "template", "photo", "photobase64", "photo_base64",
+		"photo-base64", "base64photo", "base64_photo", "base64-photo", "biophoto":
+		return true
+	default:
+		return false
+	}
 }
 
 func redactedBiometricValue(encoded string) string {

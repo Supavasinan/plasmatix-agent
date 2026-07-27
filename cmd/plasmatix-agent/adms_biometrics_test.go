@@ -49,7 +49,7 @@ func TestHandleGetRequestRendersCommandForDeviceProfile(t *testing.T) {
 			devices: tracker,
 		},
 		cmdQueue:     make(map[string][]ADMSCommand),
-		pendingCmd:   make(map[int]ADMSCommand),
+		pendingCmd:   make(map[pendingCommandKey]ADMSCommand),
 		cloudCmdID:   make(map[string]struct{}),
 		queryBuffers: make(map[string][]byte),
 	}
@@ -162,7 +162,7 @@ func TestHandleGetRequestReportsRefusedCloudCommand(t *testing.T) {
 			devices: tracker,
 		},
 		cmdQueue:     make(map[string][]ADMSCommand),
-		pendingCmd:   make(map[int]ADMSCommand),
+		pendingCmd:   make(map[pendingCommandKey]ADMSCommand),
 		cloudCmdID:   make(map[string]struct{}),
 		queryBuffers: make(map[string][]byte),
 	}

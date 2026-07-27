@@ -247,7 +247,7 @@ func TestHandleCDataUploadsEveryBioDataRow(t *testing.T) {
 			devices: tracker,
 		},
 		cmdQueue:     make(map[string][]ADMSCommand),
-		pendingCmd:   make(map[int]ADMSCommand),
+		pendingCmd:   make(map[pendingCommandKey]ADMSCommand),
 		cloudCmdID:   make(map[string]struct{}),
 		queryBuffers: make(map[string][]byte),
 	}
@@ -620,6 +620,128 @@ func TestCaptureBiometricUploadsRejectsWorkBeyondBoundedQueue(t *testing.T) {
 	}
 }
 
+func TestBiometricUploadShutdownCancelsWorkersAndZeroesQueue(t *testing.T) {
+	started := make(chan struct{}, maxConcurrentBiometricUploads)
+	releaseHandlers := make(chan struct{})
+	cloud := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		select {
+		case <-r.Context().Done():
+		case <-releaseHandlers:
+		}
+	}))
+	t.Cleanup(func() {
+		close(releaseHandlers)
+		cloud.Close()
+	})
+
+	server := &ADMSServer{agent: &Agent{config: Config{PlamatixURL: cloud.URL}}}
+	buffers := make([][]byte, maxConcurrentBiometricUploads+2)
+	for index := range buffers {
+		buffers[index] = []byte("ABCD")
+		asset := CapturedBiometricAsset{
+			DeviceSN:        "TA-SHUTDOWN",
+			PIN:             strconv.Itoa(index + 1),
+			BioType:         1,
+			SlotIndex:       0,
+			AssetKind:       "fingerprint_template",
+			AlgorithmFamily: "zkfinger-v10",
+			AlgorithmMajor:  10,
+			AlgorithmMinor:  0,
+			AssetFormat:     "templatev10",
+			Bytes:           buffers[index],
+		}
+		if !server.enqueueBiometricUpload(biometricUploadJob{
+			asset:    asset,
+			metadata: asset.SafeMetadata(),
+		}) {
+			t.Fatal("initial shutdown test work was not admitted")
+		}
+	}
+	for range maxConcurrentBiometricUploads {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for biometric workers")
+		}
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		server.shutdownBiometricUploads()
+		close(shutdownDone)
+	}()
+	select {
+	case <-shutdownDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("biometric worker shutdown did not cancel active uploads")
+	}
+
+	for index, buffer := range buffers {
+		for _, value := range buffer {
+			if value != 0 {
+				t.Fatalf("buffer %d was not zeroed during shutdown", index)
+			}
+		}
+	}
+	rejected := CapturedBiometricAsset{Bytes: []byte("EFGH")}
+	if server.enqueueBiometricUpload(biometricUploadJob{asset: rejected}) {
+		t.Fatal("shutdown queue admitted new work")
+	}
+	zeroBytes(rejected.Bytes)
+}
+
+func TestBiometricUploadShutdownIsRaceSafeWithAdmission(t *testing.T) {
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		default:
+			w.WriteHeader(http.StatusCreated)
+		}
+	}))
+	defer cloud.Close()
+
+	server := &ADMSServer{agent: &Agent{config: Config{PlamatixURL: cloud.URL}}}
+	buffers := make([][]byte, 64)
+	var admissions sync.WaitGroup
+	for index := range buffers {
+		buffers[index] = []byte("ABCD")
+		admissions.Add(1)
+		go func(index int) {
+			defer admissions.Done()
+			asset := CapturedBiometricAsset{
+				DeviceSN:        "TA-RACE",
+				PIN:             strconv.Itoa(index + 1),
+				BioType:         1,
+				SlotIndex:       0,
+				AssetKind:       "fingerprint_template",
+				AlgorithmFamily: "zkfinger-v10",
+				AlgorithmMajor:  10,
+				AlgorithmMinor:  0,
+				AssetFormat:     "templatev10",
+				Bytes:           buffers[index],
+			}
+			if !server.enqueueBiometricUpload(biometricUploadJob{
+				asset:    asset,
+				metadata: asset.SafeMetadata(),
+			}) {
+				zeroBytes(asset.Bytes)
+			}
+		}(index)
+	}
+	server.shutdownBiometricUploads()
+	admissions.Wait()
+	server.shutdownBiometricUploads()
+
+	for index, buffer := range buffers {
+		for _, value := range buffer {
+			if value != 0 {
+				t.Fatalf("buffer %d was not zeroed after concurrent shutdown", index)
+			}
+		}
+	}
+}
+
 func TestHandleCDataCorrelatesServedEnrollmentCommand(t *testing.T) {
 	captureCommandID := make(chan string, 1)
 	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -648,7 +770,7 @@ func TestHandleCDataCorrelatesServedEnrollmentCommand(t *testing.T) {
 			devices: tracker,
 		},
 		cmdQueue:     make(map[string][]ADMSCommand),
-		pendingCmd:   make(map[int]ADMSCommand),
+		pendingCmd:   make(map[pendingCommandKey]ADMSCommand),
 		cloudCmdID:   make(map[string]struct{}),
 		queryBuffers: make(map[string][]byte),
 	}
@@ -758,8 +880,8 @@ func TestBiometricCaptureCommandCorrelationFailsClosed(t *testing.T) {
 	key := biometricCaptureKey{DeviceSN: "TA6", PIN: "14", BioType: 1, Slot: 3}
 	server = &ADMSServer{
 		agent: &Agent{},
-		pendingCmd: map[int]ADMSCommand{
-			1: {ID: 1, CloudID: validID},
+		pendingCmd: map[pendingCommandKey]ADMSCommand{
+			{DeviceSN: "TA6", LocalID: 1}: {ID: 1, CloudID: validID},
 		},
 		cloudCmdID: map[string]struct{}{validID: {}},
 		captureCmd: map[biometricCaptureKey]pendingBiometricCapture{
@@ -776,6 +898,170 @@ func TestBiometricCaptureCommandCorrelationFailsClosed(t *testing.T) {
 	)
 	if got := server.biometricCaptureCommandID(matchingAsset); got != "" {
 		t.Fatalf("failed enrollment command remained correlated: %q", got)
+	}
+}
+
+func TestDeviceCommandResultBindsDeviceAndFailsClosedOnReturn(t *testing.T) {
+	type reportedResult struct {
+		ReturnCode int    `json:"returnCode"`
+		ResultBody string `json:"resultBody"`
+	}
+	reported := make(chan reportedResult, 4)
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var result reportedResult
+		if err := json.NewDecoder(r.Body).Decode(&result); err != nil {
+			t.Errorf("decode command result: %v", err)
+		}
+		reported <- result
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer cloud.Close()
+
+	validID := "11111111-1111-4111-8111-111111111111"
+	captureKey := biometricCaptureKey{DeviceSN: "TA6", PIN: "14", BioType: 1, Slot: 3}
+	newServer := func() *ADMSServer {
+		return &ADMSServer{
+			agent: &Agent{config: Config{PlamatixURL: cloud.URL}},
+			pendingCmd: map[pendingCommandKey]ADMSCommand{
+				{DeviceSN: "TA6", LocalID: 1}: {ID: 1, CloudID: validID},
+			},
+			cloudCmdID: map[string]struct{}{validID: {}},
+			captureCmd: map[biometricCaptureKey]pendingBiometricCapture{
+				captureKey: {CloudID: validID, Recorded: time.Now()},
+			},
+		}
+	}
+
+	crossDevice := newServer()
+	crossDevice.handleDeviceCmd(
+		httptest.NewRecorder(),
+		httptest.NewRequest(
+			http.MethodPost,
+			"/iclock/devicecmd?SN=OTHER",
+			strings.NewReader("ID=1&Return=0"),
+		),
+	)
+	if len(crossDevice.pendingCmd) != 1 || len(crossDevice.captureCmd) != 1 {
+		t.Fatal("cross-device result mutated another device command")
+	}
+	select {
+	case result := <-reported:
+		t.Fatalf("cross-device result was reported: %#v", result)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	tests := []struct {
+		name       string
+		body       string
+		wantReturn int
+	}{
+		{name: "missing return", body: "ID=1", wantReturn: -1},
+		{name: "malformed return", body: "ID=1&Return=not-an-int", wantReturn: -1},
+		{name: "failing return", body: "ID=1&Return=-7", wantReturn: -7},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newServer()
+			server.handleDeviceCmd(
+				httptest.NewRecorder(),
+				httptest.NewRequest(
+					http.MethodPost,
+					"/iclock/devicecmd?SN=TA6",
+					strings.NewReader(tt.body+"&Template=QUJDRA==&arbitrary=plaintext"),
+				),
+			)
+			if len(server.pendingCmd) != 0 || len(server.captureCmd) != 0 {
+				t.Fatal("failed command result retained pending capture state")
+			}
+			select {
+			case result := <-reported:
+				if result.ReturnCode != tt.wantReturn {
+					t.Fatalf("reported Return = %d; want %d", result.ReturnCode, tt.wantReturn)
+				}
+				if strings.Contains(result.ResultBody, "QUJDRA") ||
+					strings.Contains(result.ResultBody, "plaintext") {
+					t.Fatalf("reported unsafe command result body %q", result.ResultBody)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for command result")
+			}
+		})
+	}
+}
+
+func TestDrainCloudCommandsDoesNotReturnArbitraryResponseBody(t *testing.T) {
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"template":"QUJDRA==","detail":"internal plaintext"}`))
+	}))
+	defer cloud.Close()
+
+	server := &ADMSServer{agent: &Agent{config: Config{PlamatixURL: cloud.URL}}}
+	_, err := server.drainCloudCommands("TA1")
+	if err == nil {
+		t.Fatal("expected command drain failure")
+	}
+	if strings.Contains(err.Error(), "QUJDRA") ||
+		strings.Contains(err.Error(), "internal plaintext") {
+		t.Fatalf("command drain returned arbitrary response body: %v", err)
+	}
+}
+
+func TestSafeBiometricFieldKeysUsesBoundedAllowlist(t *testing.T) {
+	hostileKey := strings.Repeat("QUJDRA", 200)
+	got := safeBiometricFieldKeys(map[string]string{
+		"PIN":      "14",
+		"No":       "3",
+		"Type":     "1",
+		"MajorVer": "10",
+		hostileKey: "plaintext-template",
+	})
+
+	for _, key := range got {
+		if key == hostileKey || len(key) > 16 {
+			t.Fatalf("reported untrusted field key %q", key)
+		}
+	}
+	if strings.Join(got, ",") != "MajorVer,No,PIN,Type" {
+		t.Fatalf("safe keys = %v; want bounded canonical allowlist", got)
+	}
+}
+
+func TestLogTableDataPreviewDoesNotLogArbitraryFieldNamesOrValues(t *testing.T) {
+	var output synchronizedBuffer
+	original := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(original) })
+
+	hostileKey := strings.Repeat("QUJDRA", 40)
+	logTableDataPreview("TA1", "BIODATA", []byte(hostileKey+"=plaintext-template"))
+
+	got := output.String()
+	if strings.Contains(got, hostileKey) || strings.Contains(got, "plaintext-template") {
+		t.Fatalf("preview logged arbitrary biometric field: %q", got)
+	}
+}
+
+func TestHandleCDataBioDataDoesNotUseGenericUnsafePreview(t *testing.T) {
+	var output synchronizedBuffer
+	original := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(original) })
+
+	hostileKey := strings.Repeat("QUJDRA", 40)
+	server := &ADMSServer{agent: &Agent{devices: newDeviceTracker()}}
+	server.handleCData(
+		httptest.NewRecorder(),
+		httptest.NewRequest(
+			http.MethodPost,
+			"/iclock/cdata?SN=TA1&type=BioData",
+			strings.NewReader(hostileKey+"=plaintext-template"),
+		),
+	)
+
+	got := output.String()
+	if strings.Contains(got, hostileKey) || strings.Contains(got, "plaintext-template") {
+		t.Fatalf("BioData handler logged arbitrary biometric field: %q", got)
 	}
 }
 

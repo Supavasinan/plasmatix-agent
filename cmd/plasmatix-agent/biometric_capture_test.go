@@ -179,6 +179,186 @@ func TestExtractBiometricAssetsPreservesUnknownAlgorithmAsSafeMetadata(t *testin
 	}
 }
 
+func TestExtractBiometricAssetsCanonicalizesUntrustedFormat(t *testing.T) {
+	hostile := strings.Repeat("QUJDRA", 200)
+	tests := []struct {
+		name       string
+		table      string
+		row        string
+		state      DeviceProtocolState
+		wantFormat string
+	}{
+		{
+			name:       "fingerprint",
+			table:      "FINGERTMP",
+			row:        "PIN=14\tFID=3\tFormat=" + hostile + "\tTMP=QUJDRA==",
+			state:      DeviceProtocolState{Capabilities: map[string]string{"fingeralgorithmversion": "10.0"}},
+			wantFormat: "templatev10",
+		},
+		{
+			name:       "face template",
+			table:      "BIODATA",
+			row:        "Pin=14\tNo=0\tType=9\tMajorVer=7\tMinorVer=4\tFormat=" + hostile + "\tTmp=RUZHSA==",
+			state:      DeviceProtocolState{Capabilities: map[string]string{"facealgorithmversion": "7.4"}},
+			wantFormat: "facev7",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assets, err := ExtractBiometricAssets(tt.table, []byte(tt.row), tt.state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer zeroBytes(assets[0].Bytes)
+			if got := assets[0].AssetFormat; got != tt.wantFormat {
+				t.Fatalf("asset format = %q; want canonical %q", got, tt.wantFormat)
+			}
+			metadata, err := json.Marshal(assets[0].SafeMetadata())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(metadata, []byte(hostile)) {
+				t.Fatal("safe metadata retained untrusted format")
+			}
+		})
+	}
+}
+
+func TestBiometricMetadataAndUploadCanonicalizeUntrustedFormat(t *testing.T) {
+	hostile := strings.Repeat("QUJDRA", 200)
+	observedFormat := make(chan string, 1)
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observedFormat <- r.Header.Get("X-Asset-Format")
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer cloud.Close()
+
+	asset := CapturedBiometricAsset{
+		DeviceSN:        "TA1",
+		PIN:             "14",
+		BioType:         1,
+		SlotIndex:       3,
+		AssetKind:       "fingerprint_template",
+		AlgorithmFamily: "zkfinger-v10",
+		AlgorithmMajor:  10,
+		AlgorithmMinor:  0,
+		AssetFormat:     hostile,
+		Bytes:           []byte("ABCD"),
+	}
+	if metadata := asset.SafeMetadata(); metadata.AssetFormat != "templatev10" {
+		t.Fatalf("safe metadata format = %q; want templatev10", metadata.AssetFormat)
+	}
+	agent := &Agent{config: Config{PlamatixURL: cloud.URL}}
+	if err := agent.UploadBiometricAsset(context.Background(), asset); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-observedFormat; got != "templatev10" {
+		t.Fatalf("upload format header = %q; want templatev10", got)
+	}
+}
+
+func TestExtractBiometricAssetsValidatesExplicitAlgorithmVersions(t *testing.T) {
+	tests := []struct {
+		name       string
+		metadata   string
+		capability string
+		wantMajor  int
+		wantMinor  int
+	}{
+		{
+			name:       "explicit absent uses bounded capability",
+			capability: "10.0",
+			wantMajor:  10,
+			wantMinor:  0,
+		},
+		{
+			name:       "matching explicit and capability",
+			metadata:   "\tMajorVer=10\tMinorVer=0",
+			capability: "10.0",
+			wantMajor:  10,
+			wantMinor:  0,
+		},
+		{
+			name:      "valid explicit without capability",
+			metadata:  "\tMajorVer=10\tMinorVer=0",
+			wantMajor: 10,
+			wantMinor: 0,
+		},
+		{
+			name:       "malformed explicit major",
+			metadata:   "\tMajorVer=bad\tMinorVer=0",
+			capability: "10.0",
+			wantMajor:  -1,
+			wantMinor:  -1,
+		},
+		{
+			name:       "malformed explicit minor",
+			metadata:   "\tMajorVer=10\tMinorVer=bad",
+			capability: "10.0",
+			wantMajor:  -1,
+			wantMinor:  -1,
+		},
+		{
+			name:       "partial explicit version",
+			metadata:   "\tMajorVer=10",
+			capability: "10.0",
+			wantMajor:  -1,
+			wantMinor:  -1,
+		},
+		{
+			name:       "out of range explicit version",
+			metadata:   "\tMajorVer=256\tMinorVer=0",
+			capability: "256.0",
+			wantMajor:  -1,
+			wantMinor:  -1,
+		},
+		{
+			name:       "explicit conflicts with capability",
+			metadata:   "\tMajorVer=11\tMinorVer=0",
+			capability: "10.0",
+			wantMajor:  -1,
+			wantMinor:  -1,
+		},
+		{
+			name:       "malformed capability prevents comparison",
+			metadata:   "\tMajorVer=10\tMinorVer=0",
+			capability: "not-a-version",
+			wantMajor:  -1,
+			wantMinor:  -1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := DeviceProtocolState{}
+			if tt.capability != "" {
+				state.Capabilities = map[string]string{"fingeralgorithmversion": tt.capability}
+			}
+			row := "Pin=14\tNo=3\tType=1" + tt.metadata + "\tTmp=QUJDRA=="
+			assets, err := ExtractBiometricAssets("BIODATA", []byte(row), state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer zeroBytes(assets[0].Bytes)
+			if assets[0].AlgorithmMajor != tt.wantMajor ||
+				assets[0].AlgorithmMinor != tt.wantMinor {
+				t.Fatalf(
+					"algorithm = %s/%d/%d; want major/minor %d/%d",
+					assets[0].AlgorithmFamily,
+					assets[0].AlgorithmMajor,
+					assets[0].AlgorithmMinor,
+					tt.wantMajor,
+					tt.wantMinor,
+				)
+			}
+			if tt.wantMajor < 0 && assets[0].AlgorithmFamily != "unknown" {
+				t.Fatalf("algorithm family = %q; want unknown", assets[0].AlgorithmFamily)
+			}
+		})
+	}
+}
+
 func TestExtractBiometricAssetsRejectsOversizeDecodedAsset(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -324,5 +504,34 @@ func TestUploadBiometricAssetRedactsCloudFailureAndDoesNotClaimPersistence(t *te
 		if value != 0 {
 			t.Fatal("decoded bytes were not zeroed after failed upload")
 		}
+	}
+}
+
+func TestUploadBiometricAssetNeverReturnsArbitraryResponseBody(t *testing.T) {
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"internal detail must not escape"}`))
+	}))
+	defer cloud.Close()
+
+	raw := []byte("ABCD")
+	agent := &Agent{config: Config{PlamatixURL: cloud.URL}}
+	err := agent.UploadBiometricAsset(context.Background(), CapturedBiometricAsset{
+		DeviceSN:        "TA1",
+		PIN:             "14",
+		BioType:         1,
+		SlotIndex:       3,
+		AssetKind:       "fingerprint_template",
+		AlgorithmFamily: "zkfinger-v10",
+		AlgorithmMajor:  10,
+		AlgorithmMinor:  0,
+		AssetFormat:     "templatev10",
+		Bytes:           raw,
+	})
+	if err == nil {
+		t.Fatal("expected vault persistence error")
+	}
+	if strings.Contains(err.Error(), "internal detail") {
+		t.Fatalf("upload error returned arbitrary response body: %s", err)
 	}
 }

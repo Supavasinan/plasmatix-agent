@@ -5,14 +5,14 @@
 // a real device.
 //
 // What it does, in a loop:
-//   1. GET /iclock/cdata?SN=...&options=all  (handshake)
-//   2. GET /iclock/getrequest?SN=...         (poll for cmds)
-//   3. When the agent serves a command, dispatch:
-//        - ENROLL_BIO PIN= TYPE= NO=  → POST a synthetic BioData upload
-//          AND a /iclock/devicecmd Return=0
-//        - DATA UPDATE FINGERTMP / BIODATA → POST /iclock/devicecmd Return=0
-//        - DATA QUERY USERINFO / others    → POST /iclock/querydata
-//        - anything else                   → POST /iclock/devicecmd Return=0
+//  1. GET /iclock/cdata?SN=...&options=all  (handshake)
+//  2. GET /iclock/getrequest?SN=...         (poll for cmds)
+//  3. When the agent serves a command, dispatch:
+//     - ENROLL_BIO PIN= TYPE= NO=  → POST a synthetic BioData upload
+//     AND a /iclock/devicecmd Return=0
+//     - DATA UPDATE FINGERTMP / BIODATA → POST /iclock/devicecmd Return=0
+//     - DATA QUERY USERINFO / others    → POST /iclock/querydata
+//     - anything else                   → POST /iclock/devicecmd Return=0
 //
 // Override defaults via env: AGENT_URL, DEVICE_SN, POLL_INTERVAL_MS.
 package main
@@ -37,6 +37,7 @@ type config struct {
 	agentURL     string
 	deviceSN     string
 	pollInterval time.Duration
+	profile      string
 }
 
 func loadConfig() config {
@@ -44,6 +45,7 @@ func loadConfig() config {
 		agentURL:     getenvDefault("AGENT_URL", "http://127.0.0.1:8081"),
 		deviceSN:     getenvDefault("DEVICE_SN", "MOCK0000000001"),
 		pollInterval: 1500 * time.Millisecond,
+		profile:      getenvDefault("DEVICE_PROFILE", "ta_push"),
 	}
 	if v := os.Getenv("POLL_INTERVAL_MS"); v != "" {
 		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
@@ -53,6 +55,7 @@ func loadConfig() config {
 	flag.StringVar(&c.agentURL, "agent", c.agentURL, "Agent base URL (e.g. http://127.0.0.1:8081)")
 	flag.StringVar(&c.deviceSN, "sn", c.deviceSN, "Device serial number to impersonate")
 	flag.DurationVar(&c.pollInterval, "poll", c.pollInterval, "Polling interval for /iclock/getrequest")
+	flag.StringVar(&c.profile, "profile", c.profile, "Device profile: ta_push or ac_push_3")
 	flag.Parse()
 	return c
 }
@@ -77,8 +80,8 @@ func main() {
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("mock-device starting: agent=%s sn=%s poll=%s",
-		cfg.agentURL, cfg.deviceSN, cfg.pollInterval)
+	log.Printf("mock-device starting: agent=%s sn=%s profile=%s poll=%s",
+		cfg.agentURL, cfg.deviceSN, cfg.profile, cfg.pollInterval)
 
 	if err := d.handshake(); err != nil {
 		log.Fatalf("handshake failed: %v", err)
@@ -104,6 +107,17 @@ type adminCmd struct {
 }
 
 func (d *device) handshake() error {
+	if d.cfg.profile == "ac_push_3" {
+		q := url.Values{"SN": {d.cfg.deviceSN}}
+		res, err := d.client.Get(d.cfg.agentURL + "/iclock/registry?" + q.Encode())
+		if err != nil {
+			return err
+		}
+		defer res.Body.Close()
+		body, _ := io.ReadAll(res.Body)
+		log.Printf("← /iclock/registry GET status=%d body=%q", res.StatusCode, truncate(string(body), 200))
+		return nil
+	}
 	q := url.Values{
 		"SN":       {d.cfg.deviceSN},
 		"options":  {"all"},
@@ -150,6 +164,8 @@ func (d *device) poll() (*adminCmd, error) {
 
 func (d *device) dispatch(c *adminCmd) {
 	switch {
+	case strings.HasPrefix(c.body, "ENROLL_FP"):
+		d.handleEnrollFP(c)
 	case strings.HasPrefix(c.body, "ENROLL_BIO"):
 		d.handleEnrollBio(c)
 	case strings.HasPrefix(c.body, "DATA UPDATE FINGERTMP"),
@@ -163,6 +179,34 @@ func (d *device) dispatch(c *adminCmd) {
 		d.ackCmd(c, 0, c.body)
 		log.Printf("→ ack generic id=%s Return=0", c.id)
 	}
+}
+
+func (d *device) handleEnrollFP(c *adminCmd) {
+	rest := strings.TrimSpace(strings.TrimPrefix(c.body, "ENROLL_FP"))
+	pin, fid, _ := parseSpaceKVs(rest, "PIN", "FID")
+	if pin == "" || fid == "" {
+		log.Printf("ENROLL_FP missing PIN/FID in %q — skipping", c.body)
+		d.ackCmd(c, -1, c.body)
+		return
+	}
+	tmp := randomBase64(1024)
+	record := fmt.Sprintf(
+		"PIN=%s\tFID=%s\tSize=1024\tValid=1\tTMP=%s",
+		pin,
+		fid,
+		tmp,
+	)
+	postURL := fmt.Sprintf(
+		"%s/iclock/cdata?SN=%s&table=FINGERTMP",
+		d.cfg.agentURL,
+		url.QueryEscape(d.cfg.deviceSN),
+	)
+	if _, err := d.postPlain(postURL, record); err != nil {
+		log.Printf("FINGERTMP upload failed: %v", err)
+	} else {
+		log.Printf("→ /iclock/cdata?table=FINGERTMP PIN=%s FID=%s", pin, fid)
+	}
+	d.ackCmd(c, 0, c.body)
 }
 
 // ENROLL_BIO PIN=14<SP>TYPE=1<SP>NO=3 → real device captures finger via UI,

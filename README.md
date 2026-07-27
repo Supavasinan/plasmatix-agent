@@ -1,6 +1,8 @@
 # Plasmatix Agent
 
-Standalone agent that runs on machines with access to ZKBio CVAccess. Connects back to Plasmatix via SSE (Server-Sent Events) to receive commands.
+Local edge agent for ZKTeco scanners, ZKBio CVAccess, and ZKBioTime. It
+connects back to Plasmatix and keeps official-system credentials on the local
+network.
 
 ## Features
 
@@ -9,6 +11,10 @@ Standalone agent that runs on machines with access to ZKBio CVAccess. Connects b
 - Remote commands: employee sync, attendance transactions, daily/monthly reports
 - Self-update and self-uninstall via remote commands
 - Systemd service integration
+- Adaptive TA PUSH 2.x / AC PUSH 3.x protocol detection
+- Profile-aware fingerprint enrollment, write, and delete commands
+- Durable JPEG/PNG scanner photo forwarding
+- Read-only ZKBioTime PostgreSQL migration preflight and extraction
 
 ## Installation
 
@@ -40,14 +46,14 @@ make mock
 
 Code change → Ctrl-C → `make dev` again. Build is ~2s native.
 
-The mock device handshakes, polls `/iclock/getrequest`, and when the agent
-serves an `ENROLL_BIO` it uploads a synthetic BioData record so the
-reflection path runs. Override defaults with env vars or flags:
+The mock device handshakes and polls `/iclock/getrequest`. AC PUSH fixtures
+upload synthetic BioData records; TA PUSH fixtures expect `ENROLL_FP` and
+upload FINGERTMP metadata. Override defaults with env vars or flags:
 
 ```bash
 AGENT_URL=http://127.0.0.1:8081 DEVICE_SN=NYU0000000001 make mock
 # or:
-go run ./scripts/dev/mock-device --agent http://127.0.0.1:8081 --sn NYU0000000001 --poll 1s
+go run ./scripts/dev/mock-device --agent http://127.0.0.1:8081 --sn NYU0000000001 --profile ta_push --poll 1s
 ```
 
 Other useful targets: `make build` (just compile), `make lint` (`go vet`),
@@ -72,9 +78,16 @@ The agent reads its config from `/etc/plasmatix/agent.json`:
   "plasmatix_url": "https://...",
   "zkbio_url": "https://192.168.1.10:8098",
   "zkbio_username": "admin",
-  "zkbio_password": "..."
+  "zkbio_password": "...",
+  "migration_dsn": "postgres://readonly_user:...@127.0.0.1:5432/zkbiotime?sslmode=disable"
 }
 ```
+
+`migration_dsn` is optional. Store it only in the Agent configuration and use
+a PostgreSQL role that cannot write. Migration commands run in a repeatable,
+read-only transaction and use fixed allowlisted queries. CVAccess database
+migration remains disabled until its database engine and schema are validated;
+the CVAccess REST integration continues to work.
 
 ## Commands
 
@@ -86,5 +99,8 @@ The agent reads its config from `/etc/plasmatix/agent.json`:
 | `fetchTransactions` | Fetches attendance punch records |
 | `fetchDailyReport` | Fetches daily attendance report |
 | `fetchMonthlyReport` | Fetches monthly attendance report |
+| `migration_preflight` | Verifies the local ZKBioTime database and returns a source fingerprint |
+| `migration_inventory` | Returns read-only source entity counts |
+| `migration_read_batch` | Reads one allowlisted, cursor-based source batch |
 | `update` | Downloads new binary, replaces itself, restarts |
 | `uninstall` | Stops service, removes all files, exits |

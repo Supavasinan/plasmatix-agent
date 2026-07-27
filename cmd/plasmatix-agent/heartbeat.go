@@ -157,10 +157,16 @@ func tcpProbe(ctx context.Context, ip string) bool {
 }
 
 type heartbeatDevice struct {
-	SN            string  `json:"sn"`
-	LastContactAt *string `json:"lastContactAt,omitempty"`
-	LastProbeAt   *string `json:"lastProbeAt,omitempty"`
-	ProbeOk       *bool   `json:"probeOk,omitempty"`
+	SN                   string            `json:"sn"`
+	LastContactAt        *string           `json:"lastContactAt,omitempty"`
+	LastProbeAt          *string           `json:"lastProbeAt,omitempty"`
+	ProbeOk              *bool             `json:"probeOk,omitempty"`
+	ProtocolProfile      ProtocolProfile   `json:"protocolProfile"`
+	ProtocolConfidence   int               `json:"protocolConfidence"`
+	PushVersion          string            `json:"pushVersion,omitempty"`
+	ProtocolCapabilities map[string]string `json:"protocolCapabilities,omitempty"`
+	ProtocolEvidence     []string          `json:"protocolEvidence,omitempty"`
+	ProtocolObservedAt   *string           `json:"protocolObservedAt,omitempty"`
 }
 
 type heartbeatPayload struct {
@@ -171,7 +177,14 @@ func (a *Agent) postHeartbeat(ctx context.Context) error {
 	var devices []heartbeatDevice
 	if a.devices != nil {
 		for _, d := range a.devices.snapshot() {
-			hd := heartbeatDevice{SN: d.SN}
+			hd := heartbeatDevice{
+				SN:                   d.SN,
+				ProtocolProfile:      d.Protocol.Profile,
+				ProtocolConfidence:   d.Protocol.Confidence,
+				PushVersion:          d.Protocol.PushVersion,
+				ProtocolCapabilities: d.Protocol.Capabilities,
+				ProtocolEvidence:     d.Protocol.Evidence,
+			}
 			if !d.LastContactAt.IsZero() {
 				s := d.LastContactAt.UTC().Format(time.RFC3339)
 				hd.LastContactAt = &s
@@ -182,6 +195,10 @@ func (a *Agent) postHeartbeat(ctx context.Context) error {
 			}
 			if d.ProbeOk != nil {
 				hd.ProbeOk = d.ProbeOk
+			}
+			if !d.Protocol.ObservedAt.IsZero() {
+				s := d.Protocol.ObservedAt.UTC().Format(time.RFC3339)
+				hd.ProtocolObservedAt = &s
 			}
 			devices = append(devices, hd)
 		}

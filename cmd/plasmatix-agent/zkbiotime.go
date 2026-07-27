@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +20,7 @@ import (
 )
 
 const zkbioTimeLayout = "2006-01-02 15:04:05"
+const maxSafeJSONInteger int64 = 1<<53 - 1
 
 var zkbioTimeLocation = time.FixedZone("Asia/Bangkok", 7*60*60)
 
@@ -343,6 +346,51 @@ func (c *ZKBioTimeClient) fetchTransactions(ctx context.Context, start, end stri
 	return all, nil
 }
 
+func (c *ZKBioTimeClient) fetchTransactionsAfterID(
+	ctx context.Context,
+	cursor int64,
+) ([]map[string]any, error) {
+	q := url.Values{
+		"last_id":   {strconv.FormatInt(cursor, 10)},
+		"ordering":  {"id"},
+		"page_size": {"500"},
+	}
+	code, body, err := c.do(
+		ctx,
+		http.MethodGet,
+		"/iclock/api/transactions/",
+		q,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if code != http.StatusOK {
+		return nil, fmt.Errorf(
+			"GET transactions (HTTP %d): %s",
+			code,
+			truncate(string(body), 160),
+		)
+	}
+
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, err
+	}
+	if len(envelope.Data) == 0 ||
+		bytes.Equal(bytes.TrimSpace(envelope.Data), []byte("null")) {
+		return nil, fmt.Errorf("GET transactions has missing or null data")
+	}
+
+	var rows []map[string]any
+	if err := json.Unmarshal(envelope.Data, &rows); err != nil {
+		return nil, fmt.Errorf("decode transactions data: %w", err)
+	}
+	return rows, nil
+}
+
 // ── Command handlers ─────────────────────────────────────────────────────────
 
 func (a *Agent) zkClient() (*ZKBioTimeClient, error) {
@@ -556,6 +604,49 @@ func nextZKBioTimeCheckpoint(txns []map[string]any, requestEnd time.Time) time.T
 	return next
 }
 
+func zkbioTransactionID(row map[string]any) (int64, error) {
+	raw, ok := row["id"]
+	if !ok {
+		return 0, fmt.Errorf("transaction is missing id")
+	}
+	value, ok := raw.(float64)
+	if !ok ||
+		value <= 0 ||
+		value != math.Trunc(value) ||
+		value > float64(maxSafeJSONInteger) {
+		return 0, fmt.Errorf("invalid transaction id %v", raw)
+	}
+	return int64(value), nil
+}
+
+func prepareZKBioTimeBatch(
+	rows []map[string]any,
+	cursor int64,
+) ([]map[string]any, int64, error) {
+	newer := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		id, err := zkbioTransactionID(row)
+		if err != nil {
+			return nil, cursor, err
+		}
+		if id > cursor {
+			newer = append(newer, row)
+		}
+	}
+
+	sort.Slice(newer, func(i, j int) bool {
+		left, _ := zkbioTransactionID(newer[i])
+		right, _ := zkbioTransactionID(newer[j])
+		return left < right
+	})
+	if len(newer) == 0 {
+		return newer, cursor, nil
+	}
+
+	next, _ := zkbioTransactionID(newer[len(newer)-1])
+	return newer, next, nil
+}
+
 func (a *Agent) pullZKBioTimeTransactions(ctx context.Context, c *ZKBioTimeClient, hwm, requestEnd time.Time) (time.Time, error) {
 	const overlap = 2 * time.Minute
 	start := hwm.In(zkbioTimeLocation).Add(-overlap).Format(zkbioTimeLayout)
@@ -573,6 +664,48 @@ func (a *Agent) pullZKBioTimeTransactions(ctx context.Context, c *ZKBioTimeClien
 		log.Printf("[zkbiotime] relayed %d transactions", len(txns))
 	}
 	return nextCheckpoint, nil
+}
+
+func (a *Agent) fetchZKBioTimeLastTransactionID(ctx context.Context) (int64, error) {
+	checkpointURL := fmt.Sprintf("%s/api/agent-bridge/zkbiotime/checkpoint", a.config.PlamatixURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checkpointURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-API-Key", a.config.APIKey)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(res.Body)
+		return 0, fmt.Errorf("checkpoint HTTP %d: %s", res.StatusCode, truncate(string(body), 200))
+	}
+
+	var response struct {
+		LastTransactionID json.RawMessage `json:"lastTransactionId"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		return 0, fmt.Errorf("decode checkpoint: %w", err)
+	}
+	if len(response.LastTransactionID) == 0 {
+		return 0, fmt.Errorf("decode checkpoint: missing lastTransactionId")
+	}
+	if bytes.Equal(bytes.TrimSpace(response.LastTransactionID), []byte("null")) {
+		return 0, nil
+	}
+
+	var cursor int64
+	if err := json.Unmarshal(response.LastTransactionID, &cursor); err != nil {
+		return 0, fmt.Errorf("decode lastTransactionId: %w", err)
+	}
+	if cursor < 0 {
+		return 0, fmt.Errorf("lastTransactionId must not be negative")
+	}
+	return cursor, nil
 }
 
 func (a *Agent) fetchZKBioTimeCheckpoint(ctx context.Context) (time.Time, bool, error) {

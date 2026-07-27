@@ -22,9 +22,12 @@ const (
 	maxFacePhotoBytes            = 5 * 1024 * 1024
 	maxBiometricAssetsPerRequest = 64
 	maxBiometricAlgorithmVersion = 255
+	maxBiometricIdentifierLength = 64
 )
 
 var ErrBiometricVaultDisabled = errors.New("biometric vault disabled")
+
+const invalidBiometricMetadata = "[invalid]"
 
 type CapturedBiometricAsset struct {
 	DeviceSN         string `json:"deviceSn"`
@@ -54,18 +57,39 @@ type BiometricSafeMetadata struct {
 	SHA256          string `json:"sha256"`
 }
 
+type biometricFields struct {
+	values      map[string]string
+	occurrences map[string][]string
+}
+
 func (asset CapturedBiometricAsset) SafeMetadata() BiometricSafeMetadata {
 	sum := sha256.Sum256(asset.Bytes)
+	deviceSN, validDeviceSN := canonicalBiometricIdentifier(asset.DeviceSN)
+	if !validDeviceSN {
+		deviceSN = invalidBiometricMetadata
+	}
+	pin, validPIN := canonicalBiometricIdentifier(asset.PIN)
+	if !validPIN {
+		pin = invalidBiometricMetadata
+	}
+	bioType, slot := asset.BioType, asset.SlotIndex
+	if bioType != 1 && bioType != 9 {
+		bioType = -1
+	}
+	if slot < 0 || slot > 9 {
+		slot = -1
+	}
+	kind, family, major, minor, format := safeBiometricProfile(asset)
 	return BiometricSafeMetadata{
-		DeviceSN:        asset.DeviceSN,
-		PIN:             asset.PIN,
-		BioType:         asset.BioType,
-		SlotIndex:       asset.SlotIndex,
-		AssetKind:       asset.AssetKind,
-		AlgorithmFamily: asset.AlgorithmFamily,
-		AlgorithmMajor:  asset.AlgorithmMajor,
-		AlgorithmMinor:  asset.AlgorithmMinor,
-		AssetFormat:     canonicalCapturedAssetFormat(asset),
+		DeviceSN:        deviceSN,
+		PIN:             pin,
+		BioType:         bioType,
+		SlotIndex:       slot,
+		AssetKind:       kind,
+		AlgorithmFamily: family,
+		AlgorithmMajor:  major,
+		AlgorithmMinor:  minor,
+		AssetFormat:     format,
 		ByteCount:       len(asset.Bytes),
 		SHA256:          hex.EncodeToString(sum[:]),
 	}
@@ -112,12 +136,20 @@ func ExtractBiometricAssets(
 
 func extractBiometricAsset(
 	table string,
-	fields map[string]string,
+	fields biometricFields,
 	state DeviceProtocolState,
 ) (CapturedBiometricAsset, bool, error) {
-	pin := biometricField(fields, "pin", "userid", "uid")
-	if pin == "" {
+	pin, pinPresent, pinUnique := uniqueBiometricField(fields, "pin", "userid", "uid")
+	if !pinPresent || pin == "" {
 		return CapturedBiometricAsset{}, false, errors.New("missing biometric PIN")
+	}
+	if !pinUnique {
+		return CapturedBiometricAsset{}, false, errors.New("duplicated biometric PIN")
+	}
+	var validPIN bool
+	pin, validPIN = canonicalBiometricIdentifier(pin)
+	if !validPIN {
+		return CapturedBiometricAsset{}, false, errors.New("invalid biometric PIN")
 	}
 
 	bioType := 9
@@ -183,7 +215,7 @@ func extractBiometricAsset(
 		if err != nil {
 			return CapturedBiometricAsset{}, false, err
 		}
-		if _, present := fields["type"]; present {
+		if len(fields.occurrences["type"]) > 0 {
 			fieldType, typeErr := requiredBiometricInt(fields, 1, 9, "type")
 			if typeErr != nil {
 				return CapturedBiometricAsset{}, false, typeErr
@@ -225,8 +257,11 @@ func extractBiometricAsset(
 	}, true, nil
 }
 
-func parseBiometricFields(line string) map[string]string {
-	fields := make(map[string]string)
+func parseBiometricFields(line string) biometricFields {
+	fields := biometricFields{
+		values:      make(map[string]string),
+		occurrences: make(map[string][]string),
+	}
 	for index, pair := range strings.Split(strings.TrimSpace(line), "\t") {
 		key, value, ok := strings.Cut(pair, "=")
 		if !ok {
@@ -237,14 +272,17 @@ func parseBiometricFields(line string) map[string]string {
 				key = key[separator+1:]
 			}
 		}
-		fields[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
+		fields.values[key] = value
+		fields.occurrences[key] = append(fields.occurrences[key], value)
 	}
 	return fields
 }
 
-func biometricField(fields map[string]string, keys ...string) string {
+func biometricField(fields biometricFields, keys ...string) string {
 	for _, key := range keys {
-		if value := strings.TrimSpace(fields[strings.ToLower(key)]); value != "" {
+		if value := strings.TrimSpace(fields.values[strings.ToLower(key)]); value != "" {
 			return value
 		}
 	}
@@ -252,21 +290,23 @@ func biometricField(fields map[string]string, keys ...string) string {
 }
 
 func requiredBiometricInt(
-	fields map[string]string,
+	fields biometricFields,
 	minimum int,
 	maximum int,
 	keys ...string,
 ) (int, error) {
-	var raw string
-	var present bool
+	var values []string
 	for _, key := range keys {
-		raw, present = fields[strings.ToLower(key)]
-		if present {
-			break
-		}
+		values = append(values, fields.occurrences[strings.ToLower(key)]...)
 	}
-	raw = strings.TrimSpace(raw)
-	if !present || raw == "" {
+	if len(values) == 0 {
+		return 0, errors.New("missing biometric numeric metadata")
+	}
+	if len(values) != 1 {
+		return 0, errors.New("duplicated biometric numeric metadata")
+	}
+	raw := strings.TrimSpace(values[0])
+	if raw == "" {
 		return 0, errors.New("missing biometric numeric metadata")
 	}
 	value, err := strconv.Atoi(raw)
@@ -278,7 +318,7 @@ func requiredBiometricInt(
 
 func biometricAlgorithm(
 	modality string,
-	fields map[string]string,
+	fields biometricFields,
 	state DeviceProtocolState,
 ) (string, int, int) {
 	major, majorPresent, majorOK := boundedBiometricVersionField(
@@ -315,27 +355,36 @@ func biometricAlgorithm(
 	return "zk" + modality + "-v" + strconv.Itoa(major), major, minor
 }
 
+func uniqueBiometricField(fields biometricFields, keys ...string) (string, bool, bool) {
+	var values []string
+	for _, key := range keys {
+		values = append(values, fields.occurrences[strings.ToLower(key)]...)
+	}
+	if len(values) == 0 {
+		return "", false, false
+	}
+	return strings.TrimSpace(values[0]), true, len(values) == 1
+}
+
 func boundedBiometricVersionField(
-	fields map[string]string,
+	fields biometricFields,
 	minimum int,
 	keys ...string,
 ) (int, bool, bool) {
-	var raw string
-	present := false
+	var values []string
 	for _, key := range keys {
-		value, ok := fields[strings.ToLower(key)]
-		if !ok {
-			continue
-		}
-		if present {
-			return 0, true, false
-		}
-		raw = strings.TrimSpace(value)
-		present = true
+		values = append(values, fields.occurrences[strings.ToLower(key)]...)
 	}
-	if !present {
+	if len(values) == 0 {
 		return 0, false, false
 	}
+	// Duplicates fail closed even when byte-for-byte identical. No supported
+	// ZKTeco row dialect requires repeated algorithm version fields, so
+	// accepting them would only reintroduce map-collapse ambiguity.
+	if len(values) != 1 {
+		return 0, true, false
+	}
+	raw := strings.TrimSpace(values[0])
 	value, err := strconv.Atoi(raw)
 	return value, true, err == nil &&
 		value >= minimum &&
@@ -381,6 +430,106 @@ func canonicalCapturedAssetFormat(asset CapturedBiometricAsset) string {
 	default:
 		return "unknown"
 	}
+}
+
+func canonicalBiometricIdentifier(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > maxBiometricIdentifierLength {
+		return "", false
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') ||
+			character == '.' || character == '_' || character == '-' {
+			continue
+		}
+		return "", false
+	}
+	return value, true
+}
+
+func safeBiometricProfile(asset CapturedBiometricAsset) (string, string, int, int, string) {
+	switch asset.AssetKind {
+	case "fingerprint_template":
+		if asset.BioType != 1 {
+			return "unknown", "unknown", -1, -1, "unknown"
+		}
+		if asset.AlgorithmFamily == "unknown" &&
+			asset.AlgorithmMajor == -1 &&
+			asset.AlgorithmMinor == -1 {
+			return asset.AssetKind, "unknown", -1, -1, "unknown"
+		}
+		expected := "zkfinger-v" + strconv.Itoa(asset.AlgorithmMajor)
+		if asset.AlgorithmMajor >= 1 &&
+			asset.AlgorithmMajor <= maxBiometricAlgorithmVersion &&
+			asset.AlgorithmMinor >= 0 &&
+			asset.AlgorithmMinor <= maxBiometricAlgorithmVersion &&
+			asset.AlgorithmFamily == expected {
+			return asset.AssetKind, expected, asset.AlgorithmMajor, asset.AlgorithmMinor,
+				canonicalBiometricFormat("finger", asset.AlgorithmMajor)
+		}
+	case "face_template":
+		if asset.BioType != 9 {
+			return "unknown", "unknown", -1, -1, "unknown"
+		}
+		if asset.AlgorithmFamily == "unknown" &&
+			asset.AlgorithmMajor == -1 &&
+			asset.AlgorithmMinor == -1 {
+			return asset.AssetKind, "unknown", -1, -1, "unknown"
+		}
+		expected := "zkface-v" + strconv.Itoa(asset.AlgorithmMajor)
+		if asset.AlgorithmMajor >= 1 &&
+			asset.AlgorithmMajor <= maxBiometricAlgorithmVersion &&
+			asset.AlgorithmMinor >= 0 &&
+			asset.AlgorithmMinor <= maxBiometricAlgorithmVersion &&
+			asset.AlgorithmFamily == expected {
+			return asset.AssetKind, expected, asset.AlgorithmMajor, asset.AlgorithmMinor,
+				canonicalBiometricFormat("face", asset.AlgorithmMajor)
+		}
+	case "face_comparison_photo":
+		if asset.BioType == 9 &&
+			asset.AlgorithmFamily == "portable_photo" &&
+			asset.AlgorithmMajor == 0 &&
+			asset.AlgorithmMinor == 0 {
+			return asset.AssetKind, "portable_photo", 0, 0,
+				canonicalCapturedAssetFormat(asset)
+		}
+	}
+	return "unknown", "unknown", -1, -1, "unknown"
+}
+
+func validateBiometricAssetMetadata(asset CapturedBiometricAsset) (CapturedBiometricAsset, error) {
+	deviceSN, validDeviceSN := canonicalBiometricIdentifier(asset.DeviceSN)
+	pin, validPIN := canonicalBiometricIdentifier(asset.PIN)
+	kind, family, major, minor, format := safeBiometricProfile(asset)
+	if !validDeviceSN || !validPIN ||
+		(asset.BioType != 1 && asset.BioType != 9) ||
+		asset.SlotIndex < 0 || asset.SlotIndex > 9 ||
+		kind == "unknown" ||
+		len(asset.Bytes) == 0 ||
+		(asset.CaptureCommandID != "" &&
+			!isBiometricCaptureCommandID(asset.CaptureCommandID)) {
+		return CapturedBiometricAsset{}, errors.New("invalid biometric upload metadata")
+	}
+	limit := maxFacePhotoBytes
+	switch kind {
+	case "fingerprint_template":
+		limit = maxFingerprintTemplateBytes
+	case "face_template":
+		limit = maxFaceTemplateBytes
+	}
+	if len(asset.Bytes) > limit {
+		return CapturedBiometricAsset{}, errors.New("invalid biometric upload metadata")
+	}
+	asset.DeviceSN = deviceSN
+	asset.PIN = pin
+	asset.AssetKind = kind
+	asset.AlgorithmFamily = family
+	asset.AlgorithmMajor = major
+	asset.AlgorithmMinor = minor
+	asset.AssetFormat = format
+	return asset, nil
 }
 
 func decodeBoundedBiometric(encoded string, limit int) ([]byte, error) {
@@ -458,6 +607,11 @@ func (agent *Agent) UploadBiometricAsset(
 	asset CapturedBiometricAsset,
 ) error {
 	defer zeroBytes(asset.Bytes)
+	validated, err := validateBiometricAssetMetadata(asset)
+	if err != nil {
+		return err
+	}
+	asset = validated
 
 	uploadURL := strings.TrimRight(agent.config.PlamatixURL, "/") +
 		"/api/agent-bridge/biometric-vault/capture"
@@ -475,8 +629,8 @@ func (agent *Agent) UploadBiometricAsset(
 	request.Header.Set("Content-Type", "application/octet-stream")
 	request.Header.Set("Cache-Control", "no-store")
 	request.Header.Set("X-API-Key", agent.config.APIKey)
-	request.Header.Set("X-Device-SN", sanitizeHeaderValue(asset.DeviceSN))
-	request.Header.Set("X-Personnel-ID", sanitizeHeaderValue(asset.PIN))
+	request.Header.Set("X-Device-SN", asset.DeviceSN)
+	request.Header.Set("X-Personnel-ID", asset.PIN)
 	request.Header.Set("X-Biometric-Type", strconv.Itoa(asset.BioType))
 	request.Header.Set("X-Slot-Index", strconv.Itoa(asset.SlotIndex))
 	request.Header.Set("X-Asset-Kind", asset.AssetKind)
@@ -484,7 +638,7 @@ func (agent *Agent) UploadBiometricAsset(
 	request.Header.Set("X-Algorithm-Major", strconv.Itoa(asset.AlgorithmMajor))
 	request.Header.Set("X-Algorithm-Minor", strconv.Itoa(asset.AlgorithmMinor))
 	request.Header.Set("X-Asset-Format", canonicalCapturedAssetFormat(asset))
-	request.Header.Set("X-Capture-Command-ID", sanitizeHeaderValue(asset.CaptureCommandID))
+	request.Header.Set("X-Capture-Command-ID", asset.CaptureCommandID)
 
 	response, err := cloudHTTPClient(30 * time.Second).Do(request)
 	if err != nil {

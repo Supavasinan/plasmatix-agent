@@ -15,6 +15,11 @@ var (
 )
 
 func RedactBiometricText(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		return redactBiometricJSON(trimmed)
+	}
+
 	lines := strings.Split(value, "\n")
 	for index, line := range lines {
 		lines[index] = redactBiometricLine(line)
@@ -25,18 +30,22 @@ func RedactBiometricText(value string) string {
 func redactBiometricLine(value string) string {
 	trimmed := strings.TrimSpace(value)
 	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
-		var decoded any
-		if json.Unmarshal([]byte(trimmed), &decoded) != nil {
-			return "[REDACTED:MALFORMED_JSON]"
-		}
-		redactBiometricJSONValue(decoded)
-		redacted, err := json.Marshal(decoded)
-		if err != nil {
-			return "[REDACTED:JSON]"
-		}
-		return string(redacted)
+		return redactBiometricJSON(trimmed)
 	}
 	return biometricEqualsField.ReplaceAllStringFunc(value, redactEqualsBiometricField)
+}
+
+func redactBiometricJSON(value string) string {
+	var decoded any
+	if json.Unmarshal([]byte(value), &decoded) != nil {
+		return "[REDACTED:MALFORMED_JSON]"
+	}
+	redactBiometricJSONValue(decoded)
+	redacted, err := json.Marshal(decoded)
+	if err != nil {
+		return "[REDACTED:JSON]"
+	}
+	return string(redacted)
 }
 
 func redactEqualsBiometricField(field string) string {

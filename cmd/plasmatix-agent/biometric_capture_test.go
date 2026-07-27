@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -258,6 +259,92 @@ func TestBiometricMetadataAndUploadCanonicalizeUntrustedFormat(t *testing.T) {
 	}
 }
 
+func TestBiometricMetadataAndUploadRejectUnsafeIdentityAndHeaderMetadata(t *testing.T) {
+	secret := strings.Repeat("U0VDUkVU", 40)
+	baseAsset := CapturedBiometricAsset{
+		DeviceSN:        "TA1",
+		PIN:             "14",
+		BioType:         1,
+		SlotIndex:       3,
+		AssetKind:       "fingerprint_template",
+		AlgorithmFamily: "zkfinger-v10",
+		AlgorithmMajor:  10,
+		AlgorithmMinor:  0,
+		AssetFormat:     "templatev10",
+	}
+	tests := []struct {
+		name   string
+		mutate func(*CapturedBiometricAsset)
+	}{
+		{name: "oversized device SN", mutate: func(asset *CapturedBiometricAsset) {
+			asset.DeviceSN = secret
+		}},
+		{name: "unsafe personnel ID", mutate: func(asset *CapturedBiometricAsset) {
+			asset.PIN = "14\r\n" + secret
+		}},
+		{name: "invalid biometric type", mutate: func(asset *CapturedBiometricAsset) {
+			asset.BioType = 7
+		}},
+		{name: "hostile asset kind", mutate: func(asset *CapturedBiometricAsset) {
+			asset.AssetKind = secret
+		}},
+		{name: "hostile algorithm family", mutate: func(asset *CapturedBiometricAsset) {
+			asset.AlgorithmFamily = secret
+		}},
+		{name: "out of range algorithm version", mutate: func(asset *CapturedBiometricAsset) {
+			asset.AlgorithmMajor = 256
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requests := make(chan struct{}, 1)
+			cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests <- struct{}{}
+				w.WriteHeader(http.StatusCreated)
+			}))
+			defer cloud.Close()
+
+			asset := baseAsset
+			tt.mutate(&asset)
+			asset.Bytes = []byte("ABCD")
+			metadata, err := json.Marshal(asset.SafeMetadata())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(metadata, []byte(secret)) {
+				t.Fatalf("safe metadata retained unsafe input: %s", metadata)
+			}
+
+			agent := &Agent{config: Config{PlamatixURL: cloud.URL}}
+			if err := agent.UploadBiometricAsset(context.Background(), asset); err == nil {
+				t.Fatal("unsafe upload metadata was accepted")
+			}
+			select {
+			case <-requests:
+				t.Fatal("unsafe metadata reached upload headers")
+			default:
+			}
+		})
+	}
+}
+
+func TestExtractBiometricAssetsRejectsUnsafeOrOversizedPersonnelID(t *testing.T) {
+	for _, pin := range []string{
+		"14\rsecret",
+		strings.Repeat("U0VDUkVU", 20),
+	} {
+		_, err := ExtractBiometricAssets(
+			"FINGERTMP",
+			[]byte("PIN="+pin+"\tFID=3\tTMP=QUJDRA=="),
+			DeviceProtocolState{},
+		)
+		if err == nil {
+			t.Fatalf("unsafe personnel ID %q was accepted", pin)
+		}
+	}
+}
+
 func TestExtractBiometricAssetsValidatesExplicitAlgorithmVersions(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -354,6 +441,98 @@ func TestExtractBiometricAssetsValidatesExplicitAlgorithmVersions(t *testing.T) 
 			}
 			if tt.wantMajor < 0 && assets[0].AlgorithmFamily != "unknown" {
 				t.Fatalf("algorithm family = %q; want unknown", assets[0].AlgorithmFamily)
+			}
+		})
+	}
+}
+
+func TestExtractBiometricAssetsRejectsDuplicateAlgorithmMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata string
+	}{
+		{
+			name:     "same key with identical values",
+			metadata: "\tMajorVer=10\tMajorVer=10\tMinorVer=0",
+		},
+		{
+			name:     "case variant with conflicting values",
+			metadata: "\tMajorVer=10\tmajorver=11\tMinorVer=0",
+		},
+		{
+			name:     "alias with identical values",
+			metadata: "\tMajorVer=10\tAlgorithmMajor=10\tMinorVer=0",
+		},
+		{
+			name:     "minor alias with conflicting values",
+			metadata: "\tMajorVer=10\tMinorVer=0\tAlgorithmMinor=1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			row := "Pin=14\tNo=3\tType=1" + tt.metadata + "\tTmp=QUJDRA=="
+			assets, err := ExtractBiometricAssets(
+				"BIODATA",
+				[]byte(row),
+				DeviceProtocolState{
+					Capabilities: map[string]string{"fingeralgorithmversion": "10.0"},
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer zeroBytes(assets[0].Bytes)
+			if assets[0].AlgorithmFamily != "unknown" ||
+				assets[0].AlgorithmMajor != -1 ||
+				assets[0].AlgorithmMinor != -1 {
+				t.Fatalf(
+					"duplicate algorithm metadata was trusted: %#v",
+					assets[0].SafeMetadata(),
+				)
+			}
+		})
+	}
+}
+
+func TestExtractBiometricAssetsRejectsDuplicatedCapabilityQueryValues(t *testing.T) {
+	tests := []struct {
+		name   string
+		values url.Values
+	}{
+		{
+			name: "same query key with identical values",
+			values: url.Values{
+				"FingerAlgorithmVersion": {"10.0", "10.0"},
+			},
+		},
+		{
+			name: "case-variant query keys with conflicting values",
+			values: url.Values{
+				"FingerAlgorithmVersion": {"10.0"},
+				"fingeralgorithmversion": {"11.0"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assets, err := ExtractBiometricAssets(
+				"FINGERTMP",
+				[]byte("PIN=14\tFID=3\tTMP=QUJDRA=="),
+				DeviceProtocolState{Capabilities: capabilitiesFromQuery(tt.values)},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer zeroBytes(assets[0].Bytes)
+			if assets[0].AlgorithmFamily != "unknown" ||
+				assets[0].AlgorithmMajor != -1 ||
+				assets[0].AlgorithmMinor != -1 {
+				t.Fatalf(
+					"duplicated capability was trusted: %#v",
+					assets[0].SafeMetadata(),
+				)
 			}
 		})
 	}

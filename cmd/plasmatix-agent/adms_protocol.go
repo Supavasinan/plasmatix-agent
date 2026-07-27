@@ -48,11 +48,20 @@ var reportedCapabilityKeys = map[string]struct{}{
 	"palmalgorithmversion":       {},
 }
 
+const invalidReportedCapability = "invalid"
+
 func capabilitiesFromQuery(values url.Values) map[string]string {
 	capabilities := make(map[string]string)
+	seen := make(map[string]struct{})
 	for key, entries := range values {
 		normalizedKey := strings.ToLower(strings.TrimSpace(key))
 		if _, ok := reportedCapabilityKeys[normalizedKey]; !ok || len(entries) == 0 {
+			continue
+		}
+		_, duplicatedKey := seen[normalizedKey]
+		seen[normalizedKey] = struct{}{}
+		if duplicatedKey || len(entries) != 1 {
+			capabilities[normalizedKey] = invalidReportedCapability
 			continue
 		}
 		capabilities[normalizedKey] = strings.TrimSpace(entries[0])
@@ -116,7 +125,12 @@ func normalizeCapabilities(capabilities map[string]string) map[string]string {
 	}
 	normalized := make(map[string]string, len(capabilities))
 	for key, value := range capabilities {
-		normalized[strings.ToLower(strings.TrimSpace(key))] = strings.TrimSpace(value)
+		normalizedKey := strings.ToLower(strings.TrimSpace(key))
+		if _, duplicated := normalized[normalizedKey]; duplicated {
+			normalized[normalizedKey] = invalidReportedCapability
+			continue
+		}
+		normalized[normalizedKey] = strings.TrimSpace(value)
 	}
 	return normalized
 }

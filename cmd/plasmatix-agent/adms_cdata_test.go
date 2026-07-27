@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
@@ -986,6 +987,167 @@ func TestDeviceCommandResultBindsDeviceAndFailsClosedOnReturn(t *testing.T) {
 				t.Fatal("timed out waiting for command result")
 			}
 		})
+	}
+}
+
+func TestQueryResultReportsWholeMultilineJSONWithBiometricsRedacted(t *testing.T) {
+	type reportedResult struct {
+		ResultBody string `json:"resultBody"`
+	}
+	reported := make(chan reportedResult, 1)
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var result reportedResult
+		if err := json.NewDecoder(r.Body).Decode(&result); err != nil {
+			t.Errorf("decode command result: %v", err)
+		}
+		reported <- result
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer cloud.Close()
+
+	server := &ADMSServer{
+		agent: &Agent{
+			config:  Config{PlamatixURL: cloud.URL},
+			devices: newDeviceTracker(),
+		},
+		pendingCmd: map[pendingCommandKey]ADMSCommand{
+			{DeviceSN: "TA6", LocalID: 1}: {
+				ID:      1,
+				CloudID: "11111111-1111-4111-8111-111111111111",
+			},
+		},
+		cloudCmdID: map[string]struct{}{
+			"11111111-1111-4111-8111-111111111111": {},
+		},
+		queryBuffers: make(map[string][]byte),
+	}
+	body := `{
+  "rows": [
+    {"PIN":"14","template":"QUJDRA==","attackerField":"U0VDUkVU"},
+    {"photo":{"raw":"RUZHSA=="}}
+  ]
+}`
+	server.handleQueryData(
+		httptest.NewRecorder(),
+		httptest.NewRequest(
+			http.MethodPost,
+			"/iclock/querydata?SN=TA6&cmdid=1&tablename=BIODATA&packcnt=1&packidx=1",
+			strings.NewReader(body),
+		),
+	)
+
+	select {
+	case result := <-reported:
+		if strings.Contains(result.ResultBody, "QUJDRA==") ||
+			strings.Contains(result.ResultBody, "RUZHSA==") ||
+			strings.Contains(result.ResultBody, "U0VDUkVU") {
+			t.Fatalf("query result leaked biometric content: %q", result.ResultBody)
+		}
+		if result.ResultBody != "[REDACTED:BIOMETRIC_QUERY_RESULT]" {
+			t.Fatalf("query result = %q; want constant biometric marker", result.ResultBody)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for query result")
+	}
+}
+
+func TestBiometricHandlersNeverLogRawQueryOrUnvalidatedCommandNumbers(t *testing.T) {
+	var output synchronizedBuffer
+	original := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(original) })
+
+	secret := "U0VDUkVU"
+	server := &ADMSServer{
+		agent:    &Agent{devices: newDeviceTracker()},
+		cmdQueue: make(map[string][]ADMSCommand),
+		pendingCmd: map[pendingCommandKey]ADMSCommand{
+			{DeviceSN: "TA6", LocalID: 1}: {ID: 1},
+		},
+		cloudCmdID:   make(map[string]struct{}),
+		queryBuffers: make(map[string][]byte),
+	}
+	server.handleCData(
+		httptest.NewRecorder(),
+		httptest.NewRequest(
+			http.MethodPost,
+			"/iclock/cdata?table=UNKNOWN&SN="+strings.Repeat(secret, 12)+"&secret="+secret,
+			nil,
+		),
+	)
+	server.handleGetRequest(
+		httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodGet, "/iclock/getrequest?secret="+secret, nil),
+	)
+	server.handleICLockFallback(
+		httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodGet, "/iclock/unknown?secret="+secret, nil),
+	)
+	server.handleDeviceCmd(
+		httptest.NewRecorder(),
+		httptest.NewRequest(
+			http.MethodPost,
+			"/iclock/devicecmd?SN=TA6",
+			strings.NewReader("ID="+secret+"&Return="+secret),
+		),
+	)
+
+	if got := output.String(); strings.Contains(got, secret) {
+		t.Fatalf("device-controlled query or command number reached logs: %q", got)
+	}
+}
+
+func TestReflectBioDataLogsOnlyBoundedAllowlistedFieldNames(t *testing.T) {
+	var output synchronizedBuffer
+	original := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(original) })
+
+	secret := strings.Repeat("U0VDUkVU", 20)
+	server := &ADMSServer{
+		cmdQueue:   make(map[string][]ADMSCommand),
+		cloudCmdID: make(map[string]struct{}),
+	}
+	server.reflectBioData(
+		"TA1",
+		[]byte("Pin=14\tNo=3\tType=1\tTmp=QUJDRA==\t"+secret+"=ignored"),
+	)
+	server.reflectBioData(
+		"TA1",
+		[]byte("Pin=14\tNo=3\tType="+secret+"\tTmp=QUJDRA=="),
+	)
+
+	if got := output.String(); strings.Contains(got, secret) {
+		t.Fatalf("reflectBioData logged arbitrary field name: %q", got)
+	}
+}
+
+func TestFallbackBiometricMetadataRejectsUnsafeIdentityAndKeys(t *testing.T) {
+	requests := make(chan []byte, 1)
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests <- body
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer cloud.Close()
+
+	secret := strings.Repeat("U0VDUkVU", 20)
+	server := &ADMSServer{agent: &Agent{config: Config{PlamatixURL: cloud.URL}}}
+	server.reportBiometricTemplateUpload(
+		context.Background(),
+		secret,
+		"14\r\n"+secret,
+		1,
+		3,
+		1,
+		4,
+		[]string{"PIN", secret},
+	)
+
+	select {
+	case body := <-requests:
+		t.Fatalf("unsafe fallback metadata reached cloud: %s", body)
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 

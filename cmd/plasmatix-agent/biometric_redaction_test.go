@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/url"
 	"strings"
 	"testing"
@@ -88,5 +89,67 @@ func TestBiometricRedactionFailsClosedForMalformedAndNonStringJSON(t *testing.T)
 				}
 			}
 		})
+	}
+}
+
+func TestBiometricRedactionParsesWholeMultilineJSONBeforeRedacting(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name: "pretty object",
+			input: `{
+  "person": {
+    "template": "QUJDRA==",
+    "note": "safe"
+  },
+  "photo_base64": "RUZHSA=="
+}`,
+		},
+		{
+			name: "pretty array with escaped and non-string values",
+			input: `[
+  {"Tmp": "SUpLTA==", "note": "safe"},
+  {"biophoto": {"raw": "TU5PUA=="}},
+  {"template": "QUJ\"DRA=="}
+]`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := RedactBiometricText(tt.input)
+			for _, secret := range []string{
+				"QUJDRA==",
+				"RUZHSA==",
+				"SUpLTA==",
+				"TU5PUA==",
+				`QUJ\"DRA==`,
+			} {
+				if strings.Contains(got, secret) {
+					t.Fatalf("redacted multiline JSON retained %q: %q", secret, got)
+				}
+			}
+			var decoded any
+			if err := json.Unmarshal([]byte(got), &decoded); err != nil {
+				t.Fatalf("redaction did not return valid JSON: %v; output=%q", err, got)
+			}
+			if !strings.Contains(got, `"note":"safe"`) {
+				t.Fatalf("redaction removed safe context: %q", got)
+			}
+		})
+	}
+}
+
+func TestBiometricRedactionCollapsesWholeMalformedJSONToConstantMarker(t *testing.T) {
+	tests := []string{
+		"{\n  \"template\": \"QUJDRA==\",\n  \"broken\":\n}",
+		"[\n  {\"photo\": \"RUZHSA==\"},\n",
+	}
+	for _, input := range tests {
+		if got := RedactBiometricText(input); got != "[REDACTED:MALFORMED_JSON]" {
+			t.Fatalf("malformed JSON redaction = %q; want constant marker", got)
+		}
 	}
 }

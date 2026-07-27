@@ -501,6 +501,8 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodPost {
 		table := r.URL.Query().Get("table")
+		tableName := r.URL.Query().Get("tablename")
+		accepted := 0
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			log.Printf("[ADMS] Error reading body: %v", err)
@@ -537,6 +539,7 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 			log.Printf("[ADMS] Received ATTLOG from SN=%s (%d rows)", sn, received)
+			accepted = received
 
 		case "rtlog":
 			received := 0
@@ -561,9 +564,9 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 				s.relayRtlog(rt)
 			}
 			log.Printf("[ADMS] Received rtlog from SN=%s (%d rows)", sn, received)
+			accepted = received
 
 		case "tabledata":
-			tableName := r.URL.Query().Get("tablename")
 			received := countADMSRows(body)
 			if received == 0 {
 				received = atoiOrZero(r.URL.Query().Get("count"))
@@ -580,13 +583,26 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 				// SN=NYU7253100765 spamming tablename=user pin=21). The
 				// "tablename=count" ack is only needed by the biometric
 				// template/photo tables (see commit 1f6d695).
-				if strings.EqualFold(tableName, "ATTPHOTO") ||
-					strings.EqualFold(tableName, "user") {
-					fmt.Fprint(w, "OK")
-					return
-				}
-				fmt.Fprintf(w, "%s=%d\n", tableName, received)
+				protocol, _ := s.agent.devices.protocolState(sn)
+				writeCDataAck(w, protocol.Profile, table, tableName, received)
 				return
+			}
+
+		case "FINGERTMP":
+			accepted = countADMSRows(body)
+			fields := parseFirstTabKVLine(body)
+			pin := firstField(fields, "PIN", "Pin", "pin")
+			templateNo := atoiOrZero(firstField(fields, "FID", "Fid", "fid"))
+			if pin != "" {
+				go s.reportBiometricTemplateUpload(
+					sn,
+					pin,
+					1,
+					templateNo,
+					accepted,
+					len(body),
+					safeBiometricFieldKeys(fields),
+				)
 			}
 
 		default:
@@ -600,7 +616,7 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 					bioType := atoiOrZero(firstField(fields, "TYPE", "Type", "type"))
 					templateNo := atoiOrZero(firstField(fields, "NO", "No", "no"))
 					if pin != "" && bioType > 0 {
-						go s.reportBiometricTemplateUpload(sn, pin, bioType, templateNo, countADMSRows(body), len(body), fieldKeys(fields))
+						go s.reportBiometricTemplateUpload(sn, pin, bioType, templateNo, countADMSRows(body), len(body), safeBiometricFieldKeys(fields))
 						// Echo the captured template back as DATA UPDATE BIODATA so the
 						// device commits it to its local matcher. SenseFace/Push 3.0
 						// firmware doesn't auto-persist on ENROLL_BIO — without this
@@ -612,10 +628,47 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		fmt.Fprint(w, "OK")
+		protocol, _ := s.agent.devices.protocolState(sn)
+		writeCDataAck(w, protocol.Profile, table, tableName, accepted)
 		return
 	}
 
+	fmt.Fprint(w, "OK")
+}
+
+func safeBiometricFieldKeys(fields map[string]string) []string {
+	keys := fieldKeys(fields)
+	safe := keys[:0]
+	for _, key := range keys {
+		normalized := strings.ToLower(key)
+		if normalized == "tmp" || strings.Contains(normalized, "template") {
+			continue
+		}
+		safe = append(safe, key)
+	}
+	return safe
+}
+
+func writeCDataAck(
+	w io.Writer,
+	profile ProtocolProfile,
+	table string,
+	tableName string,
+	accepted int,
+) {
+	if profile == ProtocolTAPush && table != "" && !strings.EqualFold(table, "tabledata") {
+		fmt.Fprintf(w, "OK:%d", accepted)
+		return
+	}
+	if strings.EqualFold(table, "tabledata") && tableName != "" {
+		if strings.EqualFold(tableName, "ATTPHOTO") ||
+			strings.EqualFold(tableName, "user") {
+			fmt.Fprint(w, "OK")
+			return
+		}
+		fmt.Fprintf(w, "%s=%d\n", tableName, accepted)
+		return
+	}
 	fmt.Fprint(w, "OK")
 }
 

@@ -440,6 +440,7 @@ func (a *Agent) startADMSServer() {
 	mux.HandleFunc("/iclock/ping", a.adms.handlePing)
 	mux.HandleFunc("/iclock/registry", a.adms.handleRegistry)
 	mux.HandleFunc("/iclock/push", a.adms.handlePush)
+	mux.HandleFunc("/iclock/fdata", a.adms.handleFData)
 	// Catch-all so any unknown /iclock/* path 200s instead of 404ing the
 	// device into a retry loop. Specific patterns above still take priority.
 	mux.HandleFunc("/iclock/", a.adms.handleICLockFallback)

@@ -174,19 +174,26 @@ type SessionManager struct {
 }
 
 type ADMSServer struct {
-	agent                *Agent
-	mu                   sync.Mutex
-	cmdQueue             map[string][]ADMSCommand
-	cmdID                int
-	pendingCmd           map[pendingCommandKey]ADMSCommand
-	cloudCmdID           map[string]struct{}
-	queryBuffers         map[string][]byte
-	captureCmd           map[biometricCaptureKey]pendingBiometricCapture
-	biometricUploadQueue chan biometricUploadJob
-	biometricUploadCtx   context.Context
-	biometricUploadStop  context.CancelFunc
-	biometricWorkers     sync.WaitGroup
-	biometricClosed      bool
+	agent                    *Agent
+	mu                       sync.Mutex
+	cmdQueue                 map[string][]ADMSCommand
+	cmdID                    int
+	pendingCmd               map[pendingCommandKey]ADMSCommand
+	cloudCmdID               map[string]struct{}
+	queryBuffers             map[string][]byte
+	captureCmd               map[biometricCaptureKey]pendingBiometricCapture
+	biometricUploadQueue     chan biometricUploadJob
+	biometricUploadCtx       context.Context
+	biometricUploadStop      context.CancelFunc
+	biometricWorkers         sync.WaitGroup
+	biometricClosed          bool
+	secretCmdQueue           map[string][]*secretADMSCommand
+	secretPending            map[pendingCommandKey]*secretADMSCommand
+	secretCmdID              map[string]struct{}
+	biometricDeliveryCtx     context.Context
+	biometricDeliveryStop    context.CancelFunc
+	biometricDeliveryWorkers sync.WaitGroup
+	secretClosed             bool
 }
 
 type ADMSCommand struct {
@@ -472,6 +479,9 @@ func (a *Agent) startADMSServer() {
 		queryBuffers:         make(map[string][]byte),
 		captureCmd:           make(map[biometricCaptureKey]pendingBiometricCapture),
 		biometricUploadQueue: make(chan biometricUploadJob, maxQueuedBiometricUploads),
+		secretCmdQueue:       make(map[string][]*secretADMSCommand),
+		secretPending:        make(map[pendingCommandKey]*secretADMSCommand),
+		secretCmdID:          make(map[string]struct{}),
 	}
 
 	mux := http.NewServeMux()
@@ -491,6 +501,7 @@ func (a *Agent) startADMSServer() {
 	log.Printf("ADMS server listening on %s", addr)
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		a.adms.shutdownBiometricUploads()
+		a.adms.shutdownBiometricDelivery()
 		log.Fatalf("ADMS server error: %v", err)
 	}
 }
@@ -1203,6 +1214,18 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if command := s.popSecretCommand(sn); command != nil {
+		if code := s.queuedSecretCommandCompatibility(command); code != "" {
+			s.failServedSecretCommand(command, code, -1)
+			fmt.Fprint(w, "OK")
+			return
+		}
+		if err := writeSecretADMSCommand(w, command); err != nil {
+			s.failServedSecretCommand(command, "device_command_failed", -1)
+		}
+		return
+	}
+
 	s.mu.Lock()
 	queue := s.cmdQueue[sn]
 	if len(queue) == 0 {
@@ -1213,7 +1236,16 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	cmd := queue[0]
 	s.cmdQueue[sn] = queue[1:]
+	if _, reference := parseBiometricDeploymentReference(cmd.Command); reference &&
+		cmd.CloudID != "" {
+		delete(s.cloudCmdID, cmd.CloudID)
+	}
 	s.mu.Unlock()
+
+	if s.interceptBiometricDeploymentReference(sn, cmd) {
+		fmt.Fprint(w, "OK")
+		return
+	}
 
 	protocol, _ := s.agent.devices.protocolState(sn)
 	decision := RenderDeviceCommand(protocol, cmd.Command)
@@ -1352,6 +1384,13 @@ func (s *ADMSServer) drainCloudCommands(sn string) (int, error) {
 		if strings.TrimSpace(cmd.ID) == "" || strings.TrimSpace(cmd.Cmd) == "" {
 			continue
 		}
+		if s.interceptBiometricDeploymentReference(sn, ADMSCommand{
+			Command: cmd.Cmd,
+			CloudID: cmd.ID,
+			Label:   cmd.Label,
+		}) {
+			continue
+		}
 		id := s.enqueueADMSCommand(sn, cmd.Cmd, cmd.ID, cmd.Label)
 		if id == 0 {
 			continue
@@ -1395,6 +1434,10 @@ func (s *ADMSServer) handleDeviceCmd(w http.ResponseWriter, r *http.Request) {
 			returnCode = -1
 		}
 		key := pendingCommandKey{DeviceSN: sn, LocalID: localID}
+		if s.completeSecretCommand(key, returnCode) {
+			fmt.Fprint(w, "OK")
+			return
+		}
 		s.mu.Lock()
 		cmd, ok := s.pendingCmd[key]
 		if ok {

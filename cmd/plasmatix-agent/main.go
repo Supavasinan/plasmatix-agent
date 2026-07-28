@@ -987,51 +987,15 @@ func countADMSRows(body []byte) int {
 
 func logTableDataPreview(sn, tableName string, body []byte) {
 	fields := parseFirstTabKVLine(body)
-	if len(fields) == 0 {
-		log.Printf("[ADMS] tabledata preview: SN=%s tablename=%s bodyBytes=%d",
-			safeBiometricLogIdentifier(sn), safeProtocolLogValue(tableName), len(body))
-		return
-	}
-	if strings.EqualFold(tableName, "FINGERTMP") ||
-		strings.EqualFold(tableName, "BIODATA") ||
-		strings.EqualFold(tableName, "BIOPHOTO") {
-		log.Printf(
-			"[ADMS] tabledata preview: SN=%s tablename=%s keys=%s bodyBytes=%d",
-			safeBiometricLogIdentifier(sn),
-			safeProtocolLogValue(tableName),
-			strings.Join(safeBiometricFieldKeys(fields), ","),
-			len(body),
-		)
-		return
-	}
-
-	safe := make([]string, 0, len(fields))
-	for _, key := range []string{"PIN", "Pin", "pin", "UserID", "uid", "type", "Type", "bio_type", "no", "No", "fingerid", "FingerID", "valid", "Valid", "size", "sn"} {
-		value, ok := fields[key]
-		if !ok {
-			continue
-		}
-		if len(value) > 80 {
-			value = value[:80] + "..."
-		}
-		safe = append(safe, fmt.Sprintf("%s=%s", key, value))
-	}
-	if len(safe) == 0 {
-		for key, value := range fields {
-			lower := strings.ToLower(key)
-			if strings.Contains(lower, "photo") || strings.Contains(lower, "template") || strings.Contains(lower, "tmp") || strings.Contains(lower, "bio") {
-				continue
-			}
-			if len(value) > 80 {
-				value = value[:80] + "..."
-			}
-			safe = append(safe, fmt.Sprintf("%s=%s", key, value))
-			if len(safe) >= 6 {
-				break
-			}
-		}
-	}
-	log.Printf("[ADMS] tabledata preview: SN=%s tablename=%s %s", sn, tableName, strings.Join(safe, " "))
+	_ = sn
+	keys := safeBiometricFieldKeys(fields)
+	log.Printf(
+		"[ADMS] tabledata preview: table=%s keys=%s rows=%d bodyBytes=%d",
+		safeProtocolLogValue(tableName),
+		strings.Join(keys, ","),
+		countADMSRows(body),
+		len(body),
+	)
 }
 
 func parseFirstTabKVLine(body []byte) map[string]string {
@@ -1826,14 +1790,7 @@ func (s *ADMSServer) handleQueryData(w http.ResponseWriter, r *http.Request) {
 			s.mu.Unlock()
 
 			if ok && cmd.CloudID != "" {
-				resultBody := RedactBiometricText(string(aggregated))
-				if strings.EqualFold(tableName, "BIODATA") ||
-					strings.EqualFold(tableName, "BIOPHOTO") ||
-					strings.EqualFold(tableName, "FINGERTMP") ||
-					strings.EqualFold(queryType, "BIODATA") ||
-					strings.EqualFold(queryType, "BIOPHOTO") {
-					resultBody = "[REDACTED:BIOMETRIC_QUERY_RESULT]"
-				}
+				resultBody := trustedQueryResultBody(cmd.Command, aggregated)
 				go s.reportCloudCommandResult(
 					cmd.CloudID,
 					0,
@@ -1844,6 +1801,17 @@ func (s *ADMSServer) handleQueryData(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeQueryDataAck(w, cmdidStr)
+}
+
+func trustedQueryResultBody(command string, body []byte) string {
+	switch command {
+	case "DATA QUERY ATTLOG", "DATA QUERY USERINFO":
+		return RedactBiometricText(string(body))
+	case "DATA QUERY FINGERTMP", "DATA QUERY BIODATA", "DATA QUERY BIOPHOTO":
+		return "[REDACTED:BIOMETRIC_QUERY_RESULT]"
+	default:
+		return "[REDACTED:BIOMETRIC_QUERY_RESULT]"
+	}
 }
 
 // ZK iClock Proxy firmwares expect "OK: <cmdid>" so the device can mark the

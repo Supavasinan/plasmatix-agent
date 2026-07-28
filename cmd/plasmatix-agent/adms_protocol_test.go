@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 )
 
@@ -142,6 +143,72 @@ func TestObserveProtocolNormalizesCapabilityKeys(t *testing.T) {
 	}
 	if state.Capabilities["facefunon"] != "1" {
 		t.Fatalf("face capability = %#v", state.Capabilities)
+	}
+}
+
+func TestObserveProtocolInvalidCapabilityOverwritesOlderTrustedStateWithoutPushVersion(t *testing.T) {
+	tests := []struct {
+		name   string
+		values url.Values
+	}{
+		{
+			name: "duplicate algorithm values",
+			values: url.Values{
+				"FingerAlgorithmVersion": {"10.0", "10.0"},
+			},
+		},
+		{
+			name: "case variant algorithm keys",
+			values: url.Values{
+				"FingerAlgorithmVersion": {"10.0"},
+				"fingeralgorithmversion": {"10.0"},
+			},
+		},
+		{
+			name: "malformed algorithm value",
+			values: url.Values{
+				"FingerAlgorithmVersion": {"not-a-version"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			state := ObserveProtocol(DeviceProtocolState{}, ProtocolObservation{
+				Path:        "/iclock/cdata",
+				PushVersion: "2.4.1",
+				Capabilities: map[string]string{
+					"fingeralgorithmversion": "10.0",
+					"facealgorithmversion":   "12.0",
+				},
+			})
+			state = ObserveProtocol(state, ProtocolObservation{
+				Path:         "/iclock/cdata",
+				Capabilities: capabilitiesFromQuery(tt.values),
+			})
+
+			if state.Capabilities["fingeralgorithmversion"] == "10.0" {
+				t.Fatalf("finger capability retained older trusted value: %#v", state.Capabilities)
+			}
+			if state.Capabilities["facealgorithmversion"] != "12.0" {
+				t.Fatalf("unobserved face capability changed: %#v", state.Capabilities)
+			}
+
+			assets, err := ExtractBiometricAssets(
+				"FINGERTMP",
+				[]byte("PIN=14\tFID=3\tTMP=QUJDRA=="),
+				state,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer zeroBytes(assets[0].Bytes)
+			if assets[0].AlgorithmFamily != "unknown" ||
+				assets[0].AlgorithmMajor != -1 ||
+				assets[0].AlgorithmMinor != -1 {
+				t.Fatalf("invalid observation left algorithm trusted: %#v", assets[0].SafeMetadata())
+			}
+		})
 	}
 }
 

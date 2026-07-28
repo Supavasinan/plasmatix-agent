@@ -73,20 +73,25 @@ func capabilitiesFromQuery(values url.Values) map[string]string {
 }
 
 func ObserveProtocol(current DeviceProtocolState, observation ProtocolObservation) DeviceProtocolState {
+	observedCapabilities := normalizeCapabilities(observation.Capabilities)
+	mergedCapabilities := mergeCapabilities(current.Capabilities, observedCapabilities)
+
 	if observation.Path == "/iclock/registry" || observation.Path == "/iclock/push" {
 		if current.Profile == ProtocolTAPush && current.Confidence >= 80 {
 			return DeviceProtocolState{
-				Profile:    ProtocolUnknown,
-				Confidence: 0,
-				Evidence:   appendEvidence(current.Evidence, "conflicting_ac_push_route"),
-				ObservedAt: time.Now(),
+				Profile:      ProtocolUnknown,
+				Confidence:   0,
+				Capabilities: mergedCapabilities,
+				Evidence:     appendEvidence(current.Evidence, "conflicting_ac_push_route"),
+				ObservedAt:   time.Now(),
 			}
 		}
 		return DeviceProtocolState{
-			Profile:    ProtocolACPush3,
-			Confidence: 95,
-			Evidence:   appendEvidence(current.Evidence, "ac_push_route"),
-			ObservedAt: time.Now(),
+			Profile:      ProtocolACPush3,
+			Confidence:   95,
+			Capabilities: mergedCapabilities,
+			Evidence:     appendEvidence(current.Evidence, "ac_push_route"),
+			ObservedAt:   time.Now(),
 		}
 	}
 
@@ -100,7 +105,7 @@ func ObserveProtocol(current DeviceProtocolState, observation ProtocolObservatio
 					Profile:      ProtocolUnknown,
 					Confidence:   0,
 					PushVersion:  observation.PushVersion,
-					Capabilities: normalizeCapabilities(observation.Capabilities),
+					Capabilities: mergedCapabilities,
 					Evidence:     appendEvidence(current.Evidence, "conflicting_ta_push_version"),
 					ObservedAt:   time.Now(),
 				}
@@ -109,14 +114,35 @@ func ObserveProtocol(current DeviceProtocolState, observation ProtocolObservatio
 				Profile:      ProtocolTAPush,
 				Confidence:   90,
 				PushVersion:  observation.PushVersion,
-				Capabilities: normalizeCapabilities(observation.Capabilities),
+				Capabilities: mergedCapabilities,
 				Evidence:     []string{"push_version_2_x"},
 				ObservedAt:   time.Now(),
 			}
 		}
 	}
 
+	if len(observedCapabilities) > 0 {
+		current.Capabilities = mergedCapabilities
+		current.ObservedAt = time.Now()
+	}
 	return current
+}
+
+func mergeCapabilities(
+	current map[string]string,
+	observed map[string]string,
+) map[string]string {
+	if len(current) == 0 && len(observed) == 0 {
+		return nil
+	}
+	merged := make(map[string]string, len(current)+len(observed))
+	for key, value := range current {
+		merged[key] = value
+	}
+	for key, value := range observed {
+		merged[key] = value
+	}
+	return merged
 }
 
 func normalizeCapabilities(capabilities map[string]string) map[string]string {

@@ -1013,6 +1013,7 @@ func TestQueryResultReportsWholeMultilineJSONWithBiometricsRedacted(t *testing.T
 		pendingCmd: map[pendingCommandKey]ADMSCommand{
 			{DeviceSN: "TA6", LocalID: 1}: {
 				ID:      1,
+				Command: "DATA QUERY BIODATA",
 				CloudID: "11111111-1111-4111-8111-111111111111",
 			},
 		},
@@ -1048,6 +1049,110 @@ func TestQueryResultReportsWholeMultilineJSONWithBiometricsRedacted(t *testing.T
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for query result")
+	}
+}
+
+func TestQueryResultSensitivityComesFromTrustedPendingCommand(t *testing.T) {
+	type reportedResult struct {
+		ResultBody string `json:"resultBody"`
+	}
+
+	tests := []struct {
+		name       string
+		command    string
+		query      string
+		body       string
+		wantResult string
+	}{
+		{
+			name:       "biometric command ignores mismatched device table label",
+			command:    "DATA QUERY BIODATA",
+			query:      "&tablename=USER",
+			body:       "AttackerField=U0VDUkVU",
+			wantResult: "[REDACTED:BIOMETRIC_QUERY_RESULT]",
+		},
+		{
+			name:       "biometric command ignores missing device table label",
+			command:    "DATA QUERY FINGERTMP",
+			body:       "AttackerField=U0VDUkVU",
+			wantResult: "[REDACTED:BIOMETRIC_QUERY_RESULT]",
+		},
+		{
+			name:       "malformed command context fails closed",
+			command:    "DATA QUERY",
+			query:      "&tablename=USER",
+			body:       "AttackerField=U0VDUkVU",
+			wantResult: "[REDACTED:BIOMETRIC_QUERY_RESULT]",
+		},
+		{
+			name:       "missing command context fails closed",
+			query:      "&tablename=USER",
+			body:       "AttackerField=U0VDUkVU",
+			wantResult: "[REDACTED:BIOMETRIC_QUERY_RESULT]",
+		},
+		{
+			name:       "case variant command context fails closed",
+			command:    "data query USERINFO",
+			query:      "&tablename=USER",
+			body:       "Status=active",
+			wantResult: "[REDACTED:BIOMETRIC_QUERY_RESULT]",
+		},
+		{
+			name:       "trusted non-biometric command preserves redacted result",
+			command:    "DATA QUERY USERINFO",
+			query:      "&tablename=USER",
+			body:       "PIN=14\tStatus=active",
+			wantResult: "PIN=14\tStatus=active",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reported := make(chan reportedResult, 1)
+			cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var result reportedResult
+				if err := json.NewDecoder(r.Body).Decode(&result); err != nil {
+					t.Errorf("decode command result: %v", err)
+				}
+				reported <- result
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer cloud.Close()
+
+			const cloudID = "11111111-1111-4111-8111-111111111111"
+			server := &ADMSServer{
+				agent: &Agent{
+					config:  Config{PlamatixURL: cloud.URL},
+					devices: newDeviceTracker(),
+				},
+				pendingCmd: map[pendingCommandKey]ADMSCommand{
+					{DeviceSN: "TA6", LocalID: 1}: {
+						ID:      1,
+						Command: tt.command,
+						CloudID: cloudID,
+					},
+				},
+				cloudCmdID:   map[string]struct{}{cloudID: {}},
+				queryBuffers: make(map[string][]byte),
+			}
+			server.handleQueryData(
+				httptest.NewRecorder(),
+				httptest.NewRequest(
+					http.MethodPost,
+					"/iclock/querydata?SN=TA6&cmdid=1&packcnt=1&packidx=1"+tt.query,
+					strings.NewReader(tt.body),
+				),
+			)
+
+			select {
+			case result := <-reported:
+				if result.ResultBody != tt.wantResult {
+					t.Fatalf("result = %q; want %q", result.ResultBody, tt.wantResult)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for query result")
+			}
+		})
 	}
 }
 
@@ -1201,6 +1306,30 @@ func TestLogTableDataPreviewDoesNotLogArbitraryFieldNamesOrValues(t *testing.T) 
 	got := output.String()
 	if strings.Contains(got, hostileKey) || strings.Contains(got, "plaintext-template") {
 		t.Fatalf("preview logged arbitrary biometric field: %q", got)
+	}
+}
+
+func TestLogTableDataPreviewUsesOnlyCanonicalNamesAndCountsForUnknownRoutes(t *testing.T) {
+	var output synchronizedBuffer
+	original := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(original) })
+
+	secret := "U0VDUkVU"
+	logTableDataPreview(
+		"SN-"+secret,
+		"HOSTILE-"+secret,
+		[]byte("PIN="+secret+"\tType=9\tHostile"+secret+"="+secret),
+	)
+
+	got := output.String()
+	if strings.Contains(got, secret) || strings.Contains(got, "HOSTILE") {
+		t.Fatalf("preview logged attacker-controlled metadata: %q", got)
+	}
+	if !strings.Contains(got, "keys=PIN,Type") ||
+		!strings.Contains(got, "rows=1") ||
+		!strings.Contains(got, "bodyBytes=") {
+		t.Fatalf("preview omitted bounded canonical metadata: %q", got)
 	}
 }
 

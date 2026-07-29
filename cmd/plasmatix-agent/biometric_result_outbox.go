@@ -87,7 +87,17 @@ func openBiometricResultOutbox(stateDir string) (*biometricResultOutbox, error) 
 	if err != nil || info.Size() > maxBiometricResultOutboxBytes {
 		return nil, errBiometricResultOutboxCorrupt
 	}
-	decoder := json.NewDecoder(io.LimitReader(file, maxBiometricResultOutboxBytes+1))
+	body, err := io.ReadAll(io.LimitReader(
+		file,
+		maxBiometricResultOutboxBytes+1,
+	))
+	if err != nil || len(body) > maxBiometricResultOutboxBytes ||
+		!jsonHasUniqueObjectMembers(body) {
+		zeroBytes(body)
+		return nil, errBiometricResultOutboxCorrupt
+	}
+	defer zeroBytes(body)
+	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	var document biometricResultOutboxDocument
 	if decoder.Decode(&document) != nil {
@@ -104,20 +114,81 @@ func openBiometricResultOutbox(stateDir string) (*biometricResultOutbox, error) 
 		if !validBiometricResultOutboxRecord(record) {
 			return nil, errBiometricResultOutboxCorrupt
 		}
-		key := biometricResultOutboxKey(record.DeploymentID, record.CommandID)
-		if _, duplicated := seen[key]; duplicated {
+		if _, duplicated := seen[record.CommandID]; duplicated {
 			return nil, errBiometricResultOutboxCorrupt
 		}
-		seen[key] = struct{}{}
+		seen[record.CommandID] = struct{}{}
 	}
 	outbox.records = append([]biometricResultOutboxRecord(nil), document.Records...)
 	return outbox, nil
+}
+
+func jsonHasUniqueObjectMembers(body []byte) bool {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if !scanUniqueJSONValue(decoder) {
+		return false
+	}
+	_, err := decoder.Token()
+	return err == io.EOF
+}
+
+func scanUniqueJSONValue(decoder *json.Decoder) bool {
+	token, err := decoder.Token()
+	if err != nil {
+		return false
+	}
+	delimiter, composite := token.(json.Delim)
+	if !composite {
+		return true
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return false
+			}
+			key, valid := keyToken.(string)
+			if !valid {
+				return false
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return false
+			}
+			seen[key] = struct{}{}
+			if !scanUniqueJSONValue(decoder) {
+				return false
+			}
+		}
+		closing, err := decoder.Token()
+		return err == nil && closing == json.Delim('}')
+	case '[':
+		for decoder.More() {
+			if !scanUniqueJSONValue(decoder) {
+				return false
+			}
+		}
+		closing, err := decoder.Token()
+		return err == nil && closing == json.Delim(']')
+	default:
+		return false
+	}
 }
 
 func (outbox *biometricResultOutbox) enqueue(
 	deploymentID string,
 	result biometricDeploymentResult,
 	now time.Time,
+) error {
+	return outbox.enqueueWithCommit(deploymentID, result, now, nil)
+}
+
+func (outbox *biometricResultOutbox) enqueueWithCommit(
+	deploymentID string,
+	result biometricDeploymentResult,
+	now time.Time,
+	commit func(),
 ) error {
 	record := biometricResultOutboxRecord{
 		DeploymentID:  deploymentID,
@@ -134,12 +205,14 @@ func (outbox *biometricResultOutbox) enqueue(
 	}
 	outbox.mu.Lock()
 	defer outbox.mu.Unlock()
-	key := biometricResultOutboxKey(deploymentID, result.CommandID)
 	for _, current := range outbox.records {
-		if biometricResultOutboxKey(current.DeploymentID, current.CommandID) != key {
+		if current.CommandID != result.CommandID {
 			continue
 		}
 		if sameBiometricResultOutboxValue(current, record) {
+			if commit != nil {
+				commit()
+			}
 			return nil
 		}
 		return errBiometricResultOutboxConflict
@@ -151,6 +224,9 @@ func (outbox *biometricResultOutbox) enqueue(
 	if err := outbox.persistLocked(); err != nil {
 		outbox.records = outbox.records[:len(outbox.records)-1]
 		return err
+	}
+	if commit != nil {
+		commit()
 	}
 	return nil
 }
@@ -208,7 +284,10 @@ func (outbox *biometricResultOutbox) snapshot() []biometricResultOutboxRecord {
 	return append([]biometricResultOutboxRecord(nil), outbox.records...)
 }
 
-func (outbox *biometricResultOutbox) admission(commandID string) (bool, bool) {
+func (outbox *biometricResultOutbox) admission(
+	commandID string,
+	activeReservations int,
+) (bool, bool) {
 	outbox.mu.Lock()
 	defer outbox.mu.Unlock()
 	for _, record := range outbox.records {
@@ -216,7 +295,9 @@ func (outbox *biometricResultOutbox) admission(commandID string) (bool, bool) {
 			return true, true
 		}
 	}
-	return false, len(outbox.records) < maxBiometricResultOutboxRecords
+	return false,
+		len(outbox.records)+activeReservations <
+			maxBiometricResultOutboxRecords
 }
 
 func (outbox *biometricResultOutbox) next(
@@ -388,6 +469,19 @@ func (s *ADMSServer) runBiometricResultOutbox(
 	wake <-chan struct{},
 ) {
 	for {
+		if !s.flushPendingBiometricResults() {
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-wake:
+				timer.Stop()
+				continue
+			case <-timer.C:
+				continue
+			}
+		}
 		record, wait, found := s.resultOutbox.next(time.Now())
 		if !found {
 			select {

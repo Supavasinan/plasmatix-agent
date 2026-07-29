@@ -196,9 +196,12 @@ type ADMSServer struct {
 	biometricDeliveryWorkers sync.WaitGroup
 	resultOutbox             *biometricResultOutbox
 	resultOutboxErr          error
+	resultEnqueuePending     map[string]pendingBiometricResult
 	resultOutboxWake         chan struct{}
 	resultOutboxStarted      bool
 	secretClosed             bool
+	secretNow                func() time.Time
+	secretAfterFunc          func(time.Duration, func()) func() bool
 }
 
 type ADMSCommand struct {
@@ -1233,7 +1236,10 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, "OK")
 			return
 		}
-		_ = writeSecretADMSCommand(w, command)
+		written, writeErr := s.writePendingSecretADMSCommand(w, command)
+		if !written && writeErr == nil {
+			fmt.Fprint(w, "OK")
+		}
 		return
 	}
 
@@ -1414,26 +1420,26 @@ func (s *ADMSServer) drainCloudCommands(sn string) (int, error) {
 
 func (s *ADMSServer) handleDeviceCmd(w http.ResponseWriter, r *http.Request) {
 	sn := r.URL.Query().Get("SN")
-	var body []byte
-	var err error
-	secretACK := s.hasPendingSecretCommand(sn)
-	if secretACK {
-		body, err = io.ReadAll(io.LimitReader(r.Body, maxSecretACKBodyBytes+1))
-	} else {
-		body, err = io.ReadAll(r.Body)
-	}
+	body, err := io.ReadAll(io.LimitReader(
+		r.Body,
+		maxDeviceCommandACKBodyBytes+1,
+	))
 	if err != nil {
 		zeroBytes(body)
 		log.Printf("[ADMS] Error reading devicecmd body: %v", err)
 		fmt.Fprint(w, "OK")
 		return
 	}
-	if secretACK {
+	defer zeroBytes(body)
+	if s.routeDeviceCommandACK(sn, body) == deviceCommandACKSecret {
 		_, _ = s.handleSecretDeviceCommandACK(sn, body)
 		fmt.Fprint(w, "OK")
 		return
 	}
-	defer zeroBytes(body)
+	if len(body) > maxDeviceCommandACKBodyBytes {
+		fmt.Fprint(w, "OK")
+		return
+	}
 
 	params, parseErr := url.ParseQuery(string(body))
 	localID, validID := strictDeviceCommandInteger(

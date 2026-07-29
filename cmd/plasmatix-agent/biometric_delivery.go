@@ -19,6 +19,7 @@ import (
 const (
 	maxSecretADMSCommands         = 16
 	maxSecretACKBodyBytes         = 256
+	maxDeviceCommandACKBodyBytes  = 4 * 1024
 	maxSecretCommandServeAttempts = 3
 	secretCommandServeDeadline    = 30 * time.Second
 	maxBiometricClaimBodyBytes    = 64 * 1024
@@ -85,6 +86,7 @@ type secretADMSCommand struct {
 	payload       []byte
 	firstServedAt time.Time
 	serveAttempts int
+	deadlineStop  func() bool
 }
 
 func (command *secretADMSCommand) zeroPayload() {
@@ -101,6 +103,11 @@ type biometricDeploymentResult struct {
 	ErrorCode  string `json:"errorCode,omitempty"`
 	CommandID  string `json:"commandId"`
 	ReturnCode int    `json:"returnCode"`
+}
+
+type pendingBiometricResult struct {
+	deploymentID string
+	result       biometricDeploymentResult
 }
 
 type biometricDeliveryError struct {
@@ -287,6 +294,7 @@ func (a *Agent) ProcessBiometricDeployment(
 	)
 	if err != nil {
 		if deliveryErrorCode(err) != "deployment_cancelled" {
+			retainReservation = true
 			a.reportBiometricDeploymentFailure(
 				ctx,
 				deploymentID,
@@ -308,6 +316,7 @@ func (a *Agent) ProcessBiometricDeployment(
 	if !found {
 		err = deliveryError("target_profile_untrusted")
 		zeroBytes(payload)
+		retainReservation = true
 		a.reportBiometricDeploymentFailure(
 			ctx,
 			deploymentID,
@@ -323,6 +332,7 @@ func (a *Agent) ProcessBiometricDeployment(
 		zeroBytes(rendered)
 		zeroBytes(payload)
 		err = deliveryError(renderCode)
+		retainReservation = true
 		a.reportBiometricDeploymentFailure(
 			ctx,
 			deploymentID,
@@ -351,6 +361,7 @@ func (a *Agent) ProcessBiometricDeployment(
 		zeroBytes(rendered)
 		zeroBytes(payload)
 		err = deliveryError("secret_command_queue_full")
+		retainReservation = true
 		a.reportBiometricDeploymentFailure(
 			ctx,
 			deploymentID,
@@ -865,16 +876,19 @@ func (s *ADMSServer) reserveSecretCommand(commandID string) (bool, string) {
 	if s.resultOutbox == nil || s.resultOutboxErr != nil {
 		return false, "deployment_delivery_unavailable"
 	}
-	if pendingResult, capacity := s.resultOutbox.admission(commandID); pendingResult {
-		return false, ""
-	} else if !capacity {
-		return false, "secret_command_queue_full"
-	}
 	if s.secretCmdID == nil {
 		s.secretCmdID = make(map[string]struct{})
 	}
 	if _, exists := s.secretCmdID[commandID]; exists {
 		return false, ""
+	}
+	if pendingResult, capacity := s.resultOutbox.admission(
+		commandID,
+		len(s.secretCmdID),
+	); pendingResult {
+		return false, ""
+	} else if !capacity {
+		return false, "secret_command_queue_full"
 	}
 	if len(s.secretCmdID) >= maxSecretADMSCommands {
 		return false, "secret_command_queue_full"
@@ -932,6 +946,7 @@ func (s *ADMSServer) supersedeSecretDeployment(
 	for key, command := range s.secretPending {
 		if command.deploymentID == deploymentID &&
 			command.commandID != currentCommandID {
+			command.stopDeadlineLocked()
 			command.zeroPayload()
 			delete(s.secretPending, key)
 			delete(s.secretCmdID, command.commandID)
@@ -947,12 +962,13 @@ func (s *ADMSServer) popSecretCommand(deviceSN string) *secretADMSCommand {
 		}
 		if command.serveAttempts >= maxSecretCommandServeAttempts ||
 			(!command.firstServedAt.IsZero() &&
-				time.Since(command.firstServedAt) >= secretCommandServeDeadline) {
+				!s.secretCommandNow().Before(
+					command.firstServedAt.Add(secretCommandServeDeadline),
+				)) {
+			command.stopDeadlineLocked()
 			delete(s.secretPending, key)
-			delete(s.secretCmdID, command.commandID)
 			command.zeroPayload()
-			s.mu.Unlock()
-			s.startBiometricResultWorker(biometricDeploymentResult{
+			wake := s.enqueueBiometricResultLocked(biometricDeploymentResult{
 				Status:     "failed",
 				DeviceSN:   command.deviceSN,
 				SHA256:     command.sha256,
@@ -960,6 +976,10 @@ func (s *ADMSServer) popSecretCommand(deviceSN string) *secretADMSCommand {
 				CommandID:  command.commandID,
 				ReturnCode: -1,
 			}, command.deploymentID)
+			s.mu.Unlock()
+			if wake {
+				s.wakeBiometricResultOutbox()
+			}
 			return nil
 		}
 		command.serveAttempts++
@@ -980,10 +1000,67 @@ func (s *ADMSServer) popSecretCommand(deviceSN string) *secretADMSCommand {
 		DeviceSN: deviceSN,
 		LocalID:  command.id,
 	}] = command
-	command.firstServedAt = time.Now()
+	command.firstServedAt = s.secretCommandNow()
 	command.serveAttempts = 1
+	s.scheduleSecretCommandDeadlineLocked(command)
 	s.mu.Unlock()
 	return command
+}
+
+func (s *ADMSServer) secretCommandNow() time.Time {
+	if s.secretNow != nil {
+		return s.secretNow()
+	}
+	return time.Now()
+}
+
+func (s *ADMSServer) scheduleSecretCommandDeadlineLocked(
+	command *secretADMSCommand,
+) {
+	callback := func() {
+		s.expirePendingSecretCommand(command)
+	}
+	if s.secretAfterFunc != nil {
+		command.deadlineStop = s.secretAfterFunc(
+			secretCommandServeDeadline,
+			callback,
+		)
+		return
+	}
+	timer := time.AfterFunc(secretCommandServeDeadline, callback)
+	command.deadlineStop = timer.Stop
+}
+
+func (command *secretADMSCommand) stopDeadlineLocked() {
+	if command.deadlineStop != nil {
+		command.deadlineStop()
+		command.deadlineStop = nil
+	}
+}
+
+func (s *ADMSServer) expirePendingSecretCommand(command *secretADMSCommand) {
+	key := pendingCommandKey{DeviceSN: command.deviceSN, LocalID: command.id}
+	s.mu.Lock()
+	current, exists := s.secretPending[key]
+	if !exists || current != command {
+		s.mu.Unlock()
+		return
+	}
+	command.deadlineStop = nil
+	delete(s.secretPending, key)
+	command.zeroPayload()
+	wake := s.enqueueBiometricResultLocked(biometricDeploymentResult{
+		Status:     "failed",
+		DeviceSN:   command.deviceSN,
+		SHA256:     command.sha256,
+		ErrorCode:  "network_unavailable",
+		CommandID:  command.commandID,
+		ReturnCode: -1,
+	}, command.deploymentID)
+	s.mu.Unlock()
+	if wake {
+		s.wakeBiometricResultOutbox()
+	}
 }
 
 func (s *ADMSServer) queuedSecretCommandCompatibility(
@@ -1002,6 +1079,38 @@ func (s *ADMSServer) queuedSecretCommandCompatibility(
 func writeSecretADMSCommand(w http.ResponseWriter, command *secretADMSCommand) error {
 	command.payloadMu.Lock()
 	defer command.payloadMu.Unlock()
+	return writeSecretADMSCommandLocked(w, command)
+}
+
+func (s *ADMSServer) writePendingSecretADMSCommand(
+	w http.ResponseWriter,
+	command *secretADMSCommand,
+) (bool, error) {
+	key := pendingCommandKey{DeviceSN: command.deviceSN, LocalID: command.id}
+	s.mu.Lock()
+	current, exists := s.secretPending[key]
+	if !exists || current != command {
+		s.mu.Unlock()
+		return false, nil
+	}
+	command.payloadMu.Lock()
+	if len(command.payload) == 0 {
+		command.payloadMu.Unlock()
+		s.mu.Unlock()
+		return false, nil
+	}
+	s.mu.Unlock()
+	defer command.payloadMu.Unlock()
+	if err := writeSecretADMSCommandLocked(w, command); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func writeSecretADMSCommandLocked(
+	w http.ResponseWriter,
+	command *secretADMSCommand,
+) error {
 	prefix := make([]byte, 0, 32)
 	prefix = append(prefix, "C:"...)
 	prefix = strconv.AppendInt(prefix, int64(command.id), 10)
@@ -1028,12 +1137,13 @@ func (s *ADMSServer) failServedSecretCommand(
 	current, exists := s.secretPending[key]
 	removed := exists && current == command
 	if removed {
+		command.stopDeadlineLocked()
 		delete(s.secretPending, key)
 	}
 	command.zeroPayload()
-	s.mu.Unlock()
+	wake := false
 	if removed {
-		s.startBiometricResultWorker(biometricDeploymentResult{
+		wake = s.enqueueBiometricResultLocked(biometricDeploymentResult{
 			Status:     "failed",
 			DeviceSN:   command.deviceSN,
 			SHA256:     command.sha256,
@@ -1041,6 +1151,10 @@ func (s *ADMSServer) failServedSecretCommand(
 			CommandID:  command.commandID,
 			ReturnCode: returnCode,
 		}, command.deploymentID)
+	}
+	s.mu.Unlock()
+	if wake {
+		s.wakeBiometricResultOutbox()
 	}
 }
 
@@ -1051,11 +1165,12 @@ func (s *ADMSServer) completeSecretCommand(
 	s.mu.Lock()
 	command, exists := s.secretPending[key]
 	if exists {
+		command.stopDeadlineLocked()
 		delete(s.secretPending, key)
 		command.zeroPayload()
 	}
-	s.mu.Unlock()
 	if !exists {
+		s.mu.Unlock()
 		return false
 	}
 
@@ -1070,7 +1185,11 @@ func (s *ADMSServer) completeSecretCommand(
 		result.Status = "failed"
 		result.ErrorCode = "device_command_failed"
 	}
-	s.startBiometricResultWorker(result, command.deploymentID)
+	wake := s.enqueueBiometricResultLocked(result, command.deploymentID)
+	s.mu.Unlock()
+	if wake {
+		s.wakeBiometricResultOutbox()
+	}
 	return true
 }
 
@@ -1118,26 +1237,70 @@ func (s *ADMSServer) startBiometricResultWorker(
 	result biometricDeploymentResult,
 	deploymentID string,
 ) {
-	s.releaseSecretCommand(result.CommandID)
-	if s.resultOutbox == nil {
-		return
+	s.mu.Lock()
+	wake := s.enqueueBiometricResultLocked(result, deploymentID)
+	s.mu.Unlock()
+	if wake {
+		s.wakeBiometricResultOutbox()
 	}
-	if err := s.resultOutbox.enqueue(deploymentID, result, time.Now()); err != nil {
-		s.disableBiometricResultOutbox(err)
-		return
-	}
-	s.wakeBiometricResultOutbox()
 }
 
-func (s *ADMSServer) hasPendingSecretCommand(deviceSN string) bool {
+func (s *ADMSServer) enqueueBiometricResultLocked(
+	result biometricDeploymentResult,
+	deploymentID string,
+) bool {
+	if s.resultOutbox == nil {
+		delete(s.secretCmdID, result.CommandID)
+		return false
+	}
+	if err := s.resultOutbox.enqueueWithCommit(
+		deploymentID,
+		result,
+		time.Now(),
+		func() {
+			delete(s.resultEnqueuePending, result.CommandID)
+			delete(s.secretCmdID, result.CommandID)
+		},
+	); err != nil {
+		if s.resultEnqueuePending == nil {
+			s.resultEnqueuePending = make(map[string]pendingBiometricResult)
+		}
+		if _, exists := s.resultEnqueuePending[result.CommandID]; !exists {
+			s.resultEnqueuePending[result.CommandID] = pendingBiometricResult{
+				deploymentID: deploymentID,
+				result:       result,
+			}
+		}
+		return s.agent != nil
+	}
+	return true
+}
+
+func (s *ADMSServer) flushPendingBiometricResults() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for key := range s.secretPending {
-		if key.DeviceSN == deviceSN {
-			return true
+	if len(s.resultEnqueuePending) == 0 {
+		return true
+	}
+	if s.resultOutbox == nil {
+		return false
+	}
+	flushed := true
+	for commandID, pending := range s.resultEnqueuePending {
+		if err := s.resultOutbox.enqueueWithCommit(
+			pending.deploymentID,
+			pending.result,
+			time.Now(),
+			func() {
+				delete(s.resultEnqueuePending, commandID)
+				delete(s.secretCmdID, commandID)
+			},
+		); err != nil {
+			flushed = false
+			continue
 		}
 	}
-	return false
+	return flushed
 }
 
 func (s *ADMSServer) pendingSecretCommandID(deviceSN string, localID int) bool {
@@ -1148,6 +1311,108 @@ func (s *ADMSServer) pendingSecretCommandID(deviceSN string, localID int) bool {
 	}]
 	s.mu.Unlock()
 	return exists
+}
+
+type deviceCommandACKRoute uint8
+
+const (
+	deviceCommandACKUnknown deviceCommandACKRoute = iota
+	deviceCommandACKGeneric
+	deviceCommandACKSecret
+)
+
+func (s *ADMSServer) routeDeviceCommandACK(
+	deviceSN string,
+	body []byte,
+) deviceCommandACKRoute {
+	localIDs := inspectDeviceCommandRoutingIDs(body)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, localID := range localIDs {
+		if _, exists := s.secretPending[pendingCommandKey{
+			DeviceSN: deviceSN,
+			LocalID:  localID,
+		}]; exists {
+			return deviceCommandACKSecret
+		}
+	}
+	for _, localID := range localIDs {
+		if _, exists := s.pendingCmd[pendingCommandKey{
+			DeviceSN: deviceSN,
+			LocalID:  localID,
+		}]; exists {
+			return deviceCommandACKGeneric
+		}
+	}
+	return deviceCommandACKUnknown
+}
+
+func inspectDeviceCommandRoutingIDs(body []byte) []int {
+	localIDs := make([]int, 0, 1)
+	for _, field := range bytes.Split(body, []byte{'&'}) {
+		key, value, found := bytes.Cut(field, []byte{'='})
+		if !found {
+			continue
+		}
+		routingKey, valid := decodeACKRoutingComponent(key)
+		if !valid || !bytes.Equal(routingKey, []byte("ID")) {
+			zeroBytes(routingKey)
+			continue
+		}
+		zeroBytes(routingKey)
+		routingValue, valid := decodeACKRoutingComponent(value)
+		if !valid {
+			zeroBytes(routingValue)
+			continue
+		}
+		localID, valid := strictACKInteger(
+			routingValue,
+			1,
+			int(^uint32(0)>>1),
+		)
+		zeroBytes(routingValue)
+		if valid {
+			localIDs = append(localIDs, localID)
+		}
+	}
+	return localIDs
+}
+
+func decodeACKRoutingComponent(value []byte) ([]byte, bool) {
+	decoded := make([]byte, 0, len(value))
+	for index := 0; index < len(value); index++ {
+		switch value[index] {
+		case '+':
+			decoded = append(decoded, ' ')
+		case '%':
+			if index+2 >= len(value) {
+				return decoded, false
+			}
+			high, highValid := ackHexNibble(value[index+1])
+			low, lowValid := ackHexNibble(value[index+2])
+			if !highValid || !lowValid {
+				return decoded, false
+			}
+			decoded = append(decoded, high<<4|low)
+			index += 2
+		default:
+			decoded = append(decoded, value[index])
+		}
+	}
+	return decoded, true
+}
+
+func ackHexNibble(value byte) (byte, bool) {
+	switch {
+	case value >= '0' && value <= '9':
+		return value - '0', true
+	case value >= 'a' && value <= 'f':
+		return value - 'a' + 10, true
+	case value >= 'A' && value <= 'F':
+		return value - 'A' + 10, true
+	default:
+		return 0, false
+	}
 }
 
 func (s *ADMSServer) handleSecretDeviceCommandACK(
@@ -1303,6 +1568,7 @@ func (s *ADMSServer) shutdownBiometricDelivery() {
 		delete(s.secretCmdQueue, deviceSN)
 	}
 	for key, command := range s.secretPending {
+		command.stopDeadlineLocked()
 		command.zeroPayload()
 		delete(s.secretPending, key)
 	}

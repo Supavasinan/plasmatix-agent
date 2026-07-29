@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -157,6 +158,181 @@ func TestBiometricResultOutboxDeduplicatesLeaseWhileResultIsPending(t *testing.T
 	}
 }
 
+func TestBiometricResultOutboxAndActiveReservationsShareCapacityAtomically(
+	t *testing.T,
+) {
+	outbox, err := openBiometricResultOutbox(t.TempDir())
+	if err != nil {
+		t.Fatalf("open outbox: %v", err)
+	}
+	now := time.Now().UTC()
+	for index := 0; index < maxBiometricResultOutboxRecords-1; index++ {
+		if err := outbox.enqueue(
+			testUUIDForIndex(index+100),
+			testOutboxResult(testUUIDForIndex(index+200)),
+			now,
+		); err != nil {
+			t.Fatalf("enqueue durable record %d: %v", index, err)
+		}
+	}
+	server := &ADMSServer{
+		resultOutbox: outbox,
+		secretCmdID:  make(map[string]struct{}),
+	}
+	start := make(chan struct{})
+	type admission struct {
+		reserved bool
+		code     string
+	}
+	results := make(chan admission, 2)
+	for _, commandID := range []string{
+		testUUIDForIndex(400),
+		testUUIDForIndex(401),
+	} {
+		go func(commandID string) {
+			<-start
+			reserved, code := server.reserveSecretCommand(commandID)
+			results <- admission{reserved: reserved, code: code}
+		}(commandID)
+	}
+	close(start)
+	first := <-results
+	second := <-results
+	reserved := 0
+	refused := 0
+	for _, result := range []admission{first, second} {
+		switch {
+		case result.reserved && result.code == "":
+			reserved++
+		case !result.reserved && result.code == "secret_command_queue_full":
+			refused++
+		default:
+			t.Fatalf("unexpected admission result %#v", result)
+		}
+	}
+	if reserved != 1 || refused != 1 {
+		t.Fatalf("reserved=%d refused=%d; want 1,1", reserved, refused)
+	}
+	server.mu.Lock()
+	active := len(server.secretCmdID)
+	server.mu.Unlock()
+	if got := len(outbox.snapshot()) + active; got != maxBiometricResultOutboxRecords {
+		t.Fatalf("combined lifecycle count = %d; want %d",
+			got, maxBiometricResultOutboxRecords)
+	}
+}
+
+func TestBiometricResultTransitionRetainsReservationUntilDurableEnqueue(
+	t *testing.T,
+) {
+	stateDir := t.TempDir()
+	outbox, err := openBiometricResultOutbox(stateDir)
+	if err != nil {
+		t.Fatalf("open outbox: %v", err)
+	}
+	validPath := outbox.path
+	outbox.path = filepath.Join(stateDir, "missing", biometricResultOutboxFilename)
+	server := &ADMSServer{
+		resultOutbox: outbox,
+		secretCmdID:  map[string]struct{}{testCommandID: {}},
+	}
+
+	server.startBiometricResultWorker(
+		testOutboxResult(testCommandID),
+		testDeploymentID,
+	)
+
+	server.mu.Lock()
+	_, active := server.secretCmdID[testCommandID]
+	pendingResults := len(server.resultEnqueuePending)
+	outboxDisabled := server.resultOutboxErr
+	server.mu.Unlock()
+	if !active || pendingResults != 1 {
+		t.Fatalf("failed enqueue active=%v pendingResults=%d; want true,1",
+			active, pendingResults)
+	}
+	if outboxDisabled != nil {
+		t.Fatalf("one enqueue failure disabled unrelated outbox work: %v", outboxDisabled)
+	}
+	if records := len(outbox.snapshot()); records != 0 {
+		t.Fatalf("failed enqueue left %d non-durable record(s)", records)
+	}
+	reserved, code := server.reserveSecretCommand(testCommandID)
+	if reserved || code != "" {
+		t.Fatalf("same-ID transition reserved=%v code=%q; want deduplicated",
+			reserved, code)
+	}
+
+	outbox.path = validPath
+	if !server.flushPendingBiometricResults() {
+		t.Fatal("retained terminal result did not persist after recovery")
+	}
+	server.mu.Lock()
+	_, active = server.secretCmdID[testCommandID]
+	pendingResults = len(server.resultEnqueuePending)
+	server.mu.Unlock()
+	if active || pendingResults != 0 {
+		t.Fatalf("recovered enqueue active=%v pendingResults=%d; want false,0",
+			active, pendingResults)
+	}
+	reopened, err := openBiometricResultOutbox(stateDir)
+	if err != nil {
+		t.Fatalf("reopen recovered outbox: %v", err)
+	}
+	records := reopened.snapshot()
+	if len(records) != 1 ||
+		records[0].CommandID != testCommandID ||
+		records[0].ErrorCode != "network_unavailable" {
+		t.Fatalf("recovered durable records = %#v", records)
+	}
+}
+
+func TestBiometricResultCombinedCapacityRecoversAndSurvivesRestart(
+	t *testing.T,
+) {
+	stateDir := t.TempDir()
+	outbox, err := openBiometricResultOutbox(stateDir)
+	if err != nil {
+		t.Fatalf("open outbox: %v", err)
+	}
+	now := time.Now().UTC()
+	for index := 0; index < maxBiometricResultOutboxRecords; index++ {
+		if err := outbox.enqueue(
+			testUUIDForIndex(index+500),
+			testOutboxResult(testUUIDForIndex(index+600)),
+			now,
+		); err != nil {
+			t.Fatalf("enqueue record %d: %v", index, err)
+		}
+	}
+	reopened, err := openBiometricResultOutbox(stateDir)
+	if err != nil {
+		t.Fatalf("reopen full outbox: %v", err)
+	}
+	server := &ADMSServer{
+		resultOutbox: reopened,
+		secretCmdID:  make(map[string]struct{}),
+	}
+	nextCommandID := testUUIDForIndex(900)
+	if reserved, code := server.reserveSecretCommand(nextCommandID); reserved ||
+		code != "secret_command_queue_full" {
+		t.Fatalf("full restarted admission reserved=%v code=%q", reserved, code)
+	}
+	first := reopened.snapshot()[0]
+	if err := reopened.delete(first.DeploymentID, first.CommandID); err != nil {
+		t.Fatalf("delete completed record: %v", err)
+	}
+	if reserved, code := server.reserveSecretCommand(nextCommandID); !reserved ||
+		code != "" {
+		t.Fatalf("recovered admission reserved=%v code=%q", reserved, code)
+	}
+	if got := len(reopened.snapshot()) + len(server.secretCmdID); got !=
+		maxBiometricResultOutboxRecords {
+		t.Fatalf("recovered combined count = %d; want %d",
+			got, maxBiometricResultOutboxRecords)
+	}
+}
+
 func TestBiometricResultOutboxCorruptionDisablesSecretAdmission(t *testing.T) {
 	server := &ADMSServer{
 		resultOutbox:    &biometricResultOutbox{},
@@ -188,6 +364,134 @@ func TestBiometricResultOutboxCorruptionFailsClosedWithoutEchoingContent(
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Fatalf("corruption error echoed secret content: %v", err)
+	}
+}
+
+func TestBiometricResultOutboxRejectsDuplicateJSONMembersAtEveryObjectLevel(
+	t *testing.T,
+) {
+	record := fmt.Sprintf(
+		`{"deploymentId":%q,"commandId":%q,"deviceSn":"AC1",`+
+			`"status":"failed","sha256":%q,"errorCode":"network_unavailable",`+
+			`"returnCode":-1,"attempts":0,`+
+			`"nextAttemptAt":"2026-07-30T12:00:00Z"}`,
+		testDeploymentID,
+		testCommandID,
+		strings.Repeat("a", 64),
+	)
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "duplicate top-level version",
+			body: `{"version":1,"version":1,"records":[]}`,
+		},
+		{
+			name: "duplicate top-level records",
+			body: `{"version":1,"records":[],"records":[]}`,
+		},
+		{
+			name: "duplicate record command ID",
+			body: `{"version":1,"records":[{` +
+				fmt.Sprintf(
+					`"deploymentId":%q,"commandId":%q,"commandId":%q,`,
+					testDeploymentID,
+					testCommandID,
+					testCommandID,
+				) +
+				`"deviceSn":"AC1","status":"failed","sha256":"` +
+				strings.Repeat("a", 64) +
+				`","errorCode":"network_unavailable","returnCode":-1,` +
+				`"attempts":0,"nextAttemptAt":"2026-07-30T12:00:00Z"}]}`,
+		},
+		{
+			name: "duplicate record status",
+			body: `{"version":1,"records":[` +
+				strings.Replace(
+					record,
+					`"status":"failed"`,
+					`"status":"failed","status":"failed"`,
+					1,
+				) +
+				`]}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			if err := os.WriteFile(
+				filepath.Join(stateDir, biometricResultOutboxFilename),
+				[]byte(tt.body),
+				0o600,
+			); err != nil {
+				t.Fatalf("write duplicate-key outbox: %v", err)
+			}
+			if _, err := openBiometricResultOutbox(stateDir); !errors.Is(
+				err,
+				errBiometricResultOutboxCorrupt,
+			) {
+				t.Fatalf("open duplicate-key outbox error = %v; want corrupt", err)
+			}
+		})
+	}
+}
+
+func TestBiometricResultOutboxCommandIDIsGloballyUniqueAcrossDeployments(
+	t *testing.T,
+) {
+	now := time.Now().UTC()
+	firstDeployment := testDeploymentID
+	secondDeployment := testStaleID
+	outbox, err := openBiometricResultOutbox(t.TempDir())
+	if err != nil {
+		t.Fatalf("open outbox: %v", err)
+	}
+	result := testOutboxResult(testCommandID)
+	if err := outbox.enqueue(firstDeployment, result, now); err != nil {
+		t.Fatalf("enqueue first deployment: %v", err)
+	}
+	if err := outbox.enqueue(
+		secondDeployment,
+		result,
+		now,
+	); !errors.Is(err, errBiometricResultOutboxConflict) {
+		t.Fatalf("cross-deployment command conflict error = %v", err)
+	}
+
+	stateDir := t.TempDir()
+	document := biometricResultOutboxDocument{
+		Version: biometricResultOutboxVersion,
+		Records: []biometricResultOutboxRecord{
+			outbox.snapshot()[0],
+			{
+				DeploymentID:  secondDeployment,
+				CommandID:     testCommandID,
+				DeviceSN:      "AC1",
+				Status:        "failed",
+				SHA256:        strings.Repeat("a", 64),
+				ErrorCode:     "network_unavailable",
+				ReturnCode:    -1,
+				NextAttemptAt: now,
+			},
+		},
+	}
+	body, err := json.Marshal(document)
+	if err != nil {
+		t.Fatalf("marshal conflicting outbox: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(stateDir, biometricResultOutboxFilename),
+		body,
+		0o600,
+	); err != nil {
+		t.Fatalf("write conflicting outbox: %v", err)
+	}
+	if _, err := openBiometricResultOutbox(stateDir); !errors.Is(
+		err,
+		errBiometricResultOutboxCorrupt,
+	) {
+		t.Fatalf("load cross-deployment command conflict error = %v", err)
 	}
 }
 

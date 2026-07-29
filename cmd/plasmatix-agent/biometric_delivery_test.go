@@ -8,8 +8,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -247,6 +249,61 @@ func waitDeliveryResult(t *testing.T, results <-chan deliveryResultRecord) deliv
 	}
 }
 
+type manualSecretDeadline struct {
+	at       time.Time
+	callback func()
+	stopped  bool
+}
+
+type manualSecretClock struct {
+	now       time.Time
+	deadlines []*manualSecretDeadline
+}
+
+func newManualSecretClock() *manualSecretClock {
+	return &manualSecretClock{
+		now: time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC),
+	}
+}
+
+func (clock *manualSecretClock) Now() time.Time {
+	return clock.now
+}
+
+func (clock *manualSecretClock) AfterFunc(
+	delay time.Duration,
+	callback func(),
+) func() bool {
+	deadline := &manualSecretDeadline{
+		at:       clock.now.Add(delay),
+		callback: callback,
+	}
+	clock.deadlines = append(clock.deadlines, deadline)
+	return func() bool {
+		if deadline.stopped {
+			return false
+		}
+		deadline.stopped = true
+		return true
+	}
+}
+
+func (clock *manualSecretClock) Advance(elapsed time.Duration) {
+	clock.now = clock.now.Add(elapsed)
+	for _, deadline := range clock.deadlines {
+		if deadline.stopped || deadline.at.After(clock.now) {
+			continue
+		}
+		deadline.stopped = true
+		deadline.callback()
+	}
+}
+
+func useManualSecretClock(server *ADMSServer, clock *manualSecretClock) {
+	server.secretNow = clock.Now
+	server.secretAfterFunc = clock.AfterFunc
+}
+
 func TestBiometricDeliveryEndToEndAckAndLostResultRetry(t *testing.T) {
 	raw := []byte("fingerprint-template")
 	fixture := newDeliveryFixture(raw)
@@ -333,6 +390,37 @@ func TestBiometricDeliveryRejectsTokenReplayBeforeQueueing(t *testing.T) {
 	if result.Status != "failed" || result.ErrorCode != "delivery_token_replayed" ||
 		result.CommandID != testCommandID {
 		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestBiometricDeliveryFailureRetainsResultWhenDurableEnqueueFails(
+	t *testing.T,
+) {
+	fixture := newDeliveryFixture([]byte("fingerprint-template"))
+	fixture.payloadStatus = http.StatusConflict
+	cloud := httptest.NewServer(fixture.handler(t))
+	defer cloud.Close()
+	agent, server := newDeliveryAgent(t, cloud.URL)
+	server.resultOutbox.path = filepath.Join(
+		agent.stateDir,
+		"missing",
+		biometricResultOutboxFilename,
+	)
+
+	err := processTestDeployment(agent, context.Background(), testCommandID)
+	if err == nil || err.Error() != "delivery_token_replayed" {
+		t.Fatalf("error = %v; want delivery_token_replayed", err)
+	}
+	server.mu.Lock()
+	_, active := server.secretCmdID[testCommandID]
+	pending := server.resultEnqueuePending[testCommandID]
+	outboxErr := server.resultOutboxErr
+	server.mu.Unlock()
+	if !active || pending.result.CommandID != testCommandID {
+		t.Fatalf("failed process active=%v pending=%#v", active, pending)
+	}
+	if outboxErr != nil {
+		t.Fatalf("failed process disabled unrelated outbox work: %v", outboxErr)
 	}
 }
 
@@ -1022,6 +1110,126 @@ func TestBiometricDeliveryDeadlineExpiresPendingSecretCommand(t *testing.T) {
 	}
 }
 
+func TestBiometricDeliveryDeadlineExpiresWithoutAnotherScannerPoll(t *testing.T) {
+	fixture := newDeliveryFixture([]byte("fingerprint-template"))
+	cloud := httptest.NewServer(fixture.handler(t))
+	defer cloud.Close()
+	agent, server := newDeliveryAgent(t, cloud.URL)
+	clock := newManualSecretClock()
+	useManualSecretClock(server, clock)
+	if err := processTestDeployment(agent, context.Background(), testCommandID); err != nil {
+		t.Fatalf("process deployment: %v", err)
+	}
+	commandBuffer := server.secretCmdQueue["AC1"][0].payload
+	first := httptest.NewRecorder()
+	server.handleGetRequest(
+		first,
+		httptest.NewRequest(http.MethodGet, "/iclock/getrequest?SN=AC1", nil),
+	)
+	if first.Body.String() == "OK" {
+		t.Fatal("first scanner poll did not serve the command")
+	}
+
+	clock.Advance(secretCommandServeDeadline)
+
+	result := waitDeliveryResult(t, fixture.results)
+	if result.Status != "failed" ||
+		result.ErrorCode != "network_unavailable" ||
+		result.CommandID != testCommandID {
+		t.Fatalf("deadline result = %#v", result)
+	}
+	server.mu.Lock()
+	pending := len(server.secretPending)
+	reserved := len(server.secretCmdID)
+	server.mu.Unlock()
+	if pending != 0 || reserved != 0 {
+		t.Fatalf("no-poll expiry retained pending=%d reserved=%d", pending, reserved)
+	}
+	for index, value := range commandBuffer {
+		if value != 0 {
+			t.Fatalf("no-poll expiry retained command byte %d", index)
+		}
+	}
+}
+
+func TestBiometricDeliveryDeadlineAndACKBoundaryHasOneTerminalWinner(t *testing.T) {
+	tests := []struct {
+		name       string
+		timeoutWin bool
+		wantStatus string
+		wantError  string
+	}{
+		{
+			name:       "ACK wins before deadline callback",
+			wantStatus: "applied",
+		},
+		{
+			name:       "deadline callback wins before ACK",
+			timeoutWin: true,
+			wantStatus: "failed",
+			wantError:  "network_unavailable",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newDeliveryFixture([]byte("fingerprint-template"))
+			cloud := httptest.NewServer(fixture.handler(t))
+			defer cloud.Close()
+			agent, server := newDeliveryAgent(t, cloud.URL)
+			clock := newManualSecretClock()
+			useManualSecretClock(server, clock)
+			if err := processTestDeployment(
+				agent,
+				context.Background(),
+				testCommandID,
+			); err != nil {
+				t.Fatalf("process deployment: %v", err)
+			}
+			response := httptest.NewRecorder()
+			server.handleGetRequest(
+				response,
+				httptest.NewRequest(
+					http.MethodGet,
+					"/iclock/getrequest?SN=AC1",
+					nil,
+				),
+			)
+			localID := strings.SplitN(
+				strings.TrimPrefix(response.Body.String(), "C:"),
+				":",
+				2,
+			)[0]
+			ack := func() {
+				server.handleDeviceCmd(
+					httptest.NewRecorder(),
+					httptest.NewRequest(
+						http.MethodPost,
+						"/iclock/devicecmd?SN=AC1",
+						strings.NewReader("ID="+localID+"&Return=0"),
+					),
+				)
+			}
+			if tt.timeoutWin {
+				clock.Advance(secretCommandServeDeadline)
+				ack()
+			} else {
+				ack()
+				clock.Advance(secretCommandServeDeadline)
+			}
+
+			result := waitDeliveryResult(t, fixture.results)
+			if result.Status != tt.wantStatus || result.ErrorCode != tt.wantError {
+				t.Fatalf("terminal result = %#v", result)
+			}
+			select {
+			case duplicate := <-fixture.results:
+				t.Fatalf("deadline/ACK race emitted duplicate result %#v", duplicate)
+			case <-time.After(50 * time.Millisecond):
+			}
+		})
+	}
+}
+
 func TestBiometricDeliveryRetransmitRevalidatesLiveCompatibility(t *testing.T) {
 	fixture := newDeliveryFixture([]byte("fingerprint-template"))
 	cloud := httptest.NewServer(fixture.handler(t))
@@ -1231,6 +1439,176 @@ func TestBiometricDeliveryShutdownWaitsForSecretResponseWriteBeforeZeroing(
 		if value != 0 {
 			t.Fatalf("command byte %d was not zeroed after response completion", index)
 		}
+	}
+}
+
+func TestBiometricDeliveryTerminalEventBeforeWritePreventsEmptyCommandWrite(
+	t *testing.T,
+) {
+	tests := []struct {
+		name      string
+		terminate func(*ADMSServer, *manualSecretClock, int)
+	}{
+		{
+			name: "ACK before write pin",
+			terminate: func(
+				server *ADMSServer,
+				_ *manualSecretClock,
+				localID int,
+			) {
+				server.completeSecretCommand(
+					pendingCommandKey{DeviceSN: "AC1", LocalID: localID},
+					0,
+				)
+			},
+		},
+		{
+			name: "timeout before write pin",
+			terminate: func(
+				_ *ADMSServer,
+				clock *manualSecretClock,
+				_ int,
+			) {
+				clock.Advance(secretCommandServeDeadline)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := newManualSecretClock()
+			command := &secretADMSCommand{
+				deviceSN:     "AC1",
+				deploymentID: testDeploymentID,
+				commandID:    testCommandID,
+				payload:      []byte("mutable-secret-command"),
+			}
+			server := &ADMSServer{
+				secretCmdQueue: map[string][]*secretADMSCommand{
+					"AC1": {command},
+				},
+				secretPending: make(map[pendingCommandKey]*secretADMSCommand),
+				secretCmdID:   map[string]struct{}{testCommandID: {}},
+			}
+			useManualSecretClock(server, clock)
+			command = server.popSecretCommand("AC1")
+			tt.terminate(server, clock, command.id)
+
+			writer := httptest.NewRecorder()
+			written, err := server.writePendingSecretADMSCommand(writer, command)
+			if err != nil {
+				t.Fatalf("write pending command: %v", err)
+			}
+			if written {
+				t.Fatal("terminal pre-write command was counted as written")
+			}
+			if writer.Body.Len() != 0 {
+				t.Fatalf("terminal pre-write command wrote %q", writer.Body.String())
+			}
+		})
+	}
+}
+
+func TestBiometricDeliveryTerminalEventDuringWriteWaitsForPinnedPayload(
+	t *testing.T,
+) {
+	tests := []struct {
+		name      string
+		terminate func(*ADMSServer, *manualSecretClock, int)
+	}{
+		{
+			name: "ACK during write",
+			terminate: func(
+				server *ADMSServer,
+				_ *manualSecretClock,
+				localID int,
+			) {
+				server.completeSecretCommand(
+					pendingCommandKey{DeviceSN: "AC1", LocalID: localID},
+					0,
+				)
+			},
+		},
+		{
+			name: "timeout during write",
+			terminate: func(
+				_ *ADMSServer,
+				clock *manualSecretClock,
+				_ int,
+			) {
+				clock.Advance(secretCommandServeDeadline)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := newManualSecretClock()
+			original := []byte("mutable-secret-command")
+			command := &secretADMSCommand{
+				deviceSN:     "AC1",
+				deploymentID: testDeploymentID,
+				commandID:    testCommandID,
+				payload:      append([]byte(nil), original...),
+			}
+			server := &ADMSServer{
+				secretCmdQueue: map[string][]*secretADMSCommand{
+					"AC1": {command},
+				},
+				secretPending: make(map[pendingCommandKey]*secretADMSCommand),
+				secretCmdID:   map[string]struct{}{testCommandID: {}},
+			}
+			useManualSecretClock(server, clock)
+			command = server.popSecretCommand("AC1")
+			writer := &blockingSecretResponseWriter{
+				header:  make(http.Header),
+				started: make(chan struct{}),
+				release: make(chan struct{}),
+			}
+			writeDone := make(chan struct {
+				written bool
+				err     error
+			}, 1)
+			go func() {
+				written, err := server.writePendingSecretADMSCommand(
+					writer,
+					command,
+				)
+				writeDone <- struct {
+					written bool
+					err     error
+				}{written: written, err: err}
+			}()
+			<-writer.started
+			terminalDone := make(chan struct{})
+			go func() {
+				tt.terminate(server, clock, command.id)
+				close(terminalDone)
+			}()
+			select {
+			case <-terminalDone:
+				close(writer.release)
+				<-writeDone
+				t.Fatal("terminal event did not wait for pinned payload")
+			case <-time.After(50 * time.Millisecond):
+			}
+			close(writer.release)
+			writeResult := <-writeDone
+			if !writeResult.written || writeResult.err != nil {
+				t.Fatalf(
+					"pinned write written=%v err=%v",
+					writeResult.written,
+					writeResult.err,
+				)
+			}
+			<-terminalDone
+			if !bytes.Equal(writer.body, original) {
+				t.Fatalf("pinned write body = %q; want %q", writer.body, original)
+			}
+			for index, value := range command.payload {
+				if value != 0 {
+					t.Fatalf("terminal event retained payload byte %d", index)
+				}
+			}
+		})
 	}
 }
 
@@ -1566,6 +1944,51 @@ func TestBiometricDeliverySecretACKCannotFallThroughGenericPercentDecoding(
 	}
 }
 
+func TestDeviceCommandACKRoutingResolvesEncodedIDBeforeChoosingParser(
+	t *testing.T,
+) {
+	server := &ADMSServer{
+		pendingCmd: map[pendingCommandKey]ADMSCommand{
+			{DeviceSN: "AC1", LocalID: 9}: {ID: 9},
+		},
+		secretPending: map[pendingCommandKey]*secretADMSCommand{
+			{DeviceSN: "AC1", LocalID: 7}: {
+				id:       7,
+				deviceSN: "AC1",
+				payload:  []byte("mutable-command"),
+			},
+		},
+	}
+	tests := []struct {
+		name string
+		body []byte
+		want deviceCommandACKRoute
+	}{
+		{
+			name: "encoded secret ID remains strict",
+			body: []byte("%49D=%37&Return=0&Template=hostile"),
+			want: deviceCommandACKSecret,
+		},
+		{
+			name: "encoded generic ID remains generic",
+			body: []byte("%49D=%39&Return=0&Result=generic"),
+			want: deviceCommandACKGeneric,
+		},
+		{
+			name: "duplicate IDs prefer secret routing",
+			body: []byte("ID=9&ID=7&Return=0"),
+			want: deviceCommandACKSecret,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := server.routeDeviceCommandACK("AC1", tt.body); got != tt.want {
+				t.Fatalf("route = %v; want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGenericDeviceCommandACKBehaviorRemainsSeparate(t *testing.T) {
 	reported := make(chan map[string]any, 1)
 	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1608,5 +2031,144 @@ func TestGenericDeviceCommandACKBehaviorRemainsSeparate(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("generic ACK was not reported")
+	}
+}
+
+func TestGenericDeviceCommandACKWithAnotherSecretPendingKeepsGenericBehavior(
+	t *testing.T,
+) {
+	reported := make(chan map[string]any, 1)
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode generic result: %v", err)
+		}
+		reported <- body
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer cloud.Close()
+	secret := &secretADMSCommand{
+		id:           7,
+		deviceSN:     "AC1",
+		deploymentID: testDeploymentID,
+		commandID:    testCommandID,
+		payload:      []byte("mutable-command"),
+	}
+	server := &ADMSServer{
+		agent: &Agent{config: Config{
+			APIKey:      "agent-key",
+			PlamatixURL: cloud.URL,
+		}},
+		pendingCmd: map[pendingCommandKey]ADMSCommand{
+			{DeviceSN: "AC1", LocalID: 9}: {
+				ID:      9,
+				CloudID: testStaleID,
+			},
+		},
+		cloudCmdID: map[string]struct{}{testStaleID: {}},
+		secretPending: map[pendingCommandKey]*secretADMSCommand{
+			{DeviceSN: "AC1", LocalID: 7}: secret,
+		},
+		secretCmdID: map[string]struct{}{testCommandID: {}},
+	}
+	server.handleDeviceCmd(
+		httptest.NewRecorder(),
+		httptest.NewRequest(
+			http.MethodPost,
+			"/iclock/devicecmd?SN=AC1",
+			strings.NewReader(
+				"ID=9&Return=-7&Result="+strings.Repeat("g", 300),
+			),
+		),
+	)
+	select {
+	case body := <-reported:
+		if body["id"] != testStaleID ||
+			body["returnCode"] != float64(-7) ||
+			body["resultBody"] != "ID=9&Return=-7" {
+			t.Fatalf("generic result body = %#v", body)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("generic ACK alongside secret pending was not reported")
+	}
+	server.mu.Lock()
+	pendingSecret := server.secretPending[pendingCommandKey{DeviceSN: "AC1", LocalID: 7}]
+	server.mu.Unlock()
+	if pendingSecret != secret ||
+		!bytes.Equal(secret.payload, []byte("mutable-command")) {
+		t.Fatal("generic ACK changed the unrelated pending secret command")
+	}
+}
+
+type ackBodyReadBarrier struct {
+	body    []byte
+	started chan struct{}
+	release chan struct{}
+	sent    bool
+}
+
+func (reader *ackBodyReadBarrier) Read(destination []byte) (int, error) {
+	if !reader.sent {
+		reader.sent = true
+		written := copy(destination, reader.body)
+		close(reader.started)
+		return written, nil
+	}
+	<-reader.release
+	return 0, io.EOF
+}
+
+func TestDeviceCommandACKRoutesSecretCreatedWhileBodyIsRead(t *testing.T) {
+	body := []byte("ID=7&Return=0")
+	reader := &ackBodyReadBarrier{
+		body:    body,
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	command := &secretADMSCommand{
+		id:           7,
+		deviceSN:     "AC1",
+		deploymentID: testDeploymentID,
+		commandID:    testCommandID,
+		payload:      []byte("mutable-command"),
+	}
+	commandBuffer := command.payload
+	server := &ADMSServer{
+		pendingCmd:    make(map[pendingCommandKey]ADMSCommand),
+		secretPending: make(map[pendingCommandKey]*secretADMSCommand),
+		secretCmdID:   map[string]struct{}{testCommandID: {}},
+	}
+	done := make(chan struct{})
+	go func() {
+		server.handleDeviceCmd(
+			httptest.NewRecorder(),
+			httptest.NewRequest(
+				http.MethodPost,
+				"/iclock/devicecmd?SN=AC1",
+				reader,
+			),
+		)
+		close(done)
+	}()
+	<-reader.started
+	server.mu.Lock()
+	server.secretPending[pendingCommandKey{DeviceSN: "AC1", LocalID: 7}] = command
+	server.mu.Unlock()
+	close(reader.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ACK handler did not finish")
+	}
+	server.mu.Lock()
+	_, pending := server.secretPending[pendingCommandKey{DeviceSN: "AC1", LocalID: 7}]
+	server.mu.Unlock()
+	if pending {
+		t.Fatal("ACK used a pre-read device-wide snapshot and missed the exact secret ID")
+	}
+	for index, value := range commandBuffer {
+		if value != 0 {
+			t.Fatalf("ACK-created-during-read retained command byte %d", index)
+		}
 	}
 }

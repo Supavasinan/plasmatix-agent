@@ -953,12 +953,12 @@ func (s *ADMSServer) supersedeSecretDeployment(
 		}
 		s.secretCmdQueue[deviceSN] = retained
 	}
-	for key, command := range s.secretPending {
+	for _, command := range s.secretPending {
 		if command.deploymentID == deploymentID &&
 			command.commandID != currentCommandID {
-			command.stopDeadlineLocked()
-			removed = append(removed, command)
-			delete(s.secretPending, key)
+			if s.detachExactPendingSecretCommandLocked(command) {
+				removed = append(removed, command)
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -994,8 +994,7 @@ func (s *ADMSServer) claimSecretCommandWriter(
 				!s.secretCommandNow().Before(
 					command.firstServedAt.Add(secretCommandServeDeadline),
 				)) {
-			command.stopDeadlineLocked()
-			delete(s.secretPending, key)
+			s.detachExactPendingSecretCommandLocked(command)
 			s.mu.Unlock()
 			command.zeroPayload()
 			s.mu.Lock()
@@ -1080,7 +1079,7 @@ func (s *ADMSServer) expirePendingSecretCommand(command *secretADMSCommand) {
 		return
 	}
 	command.deadlineStop = nil
-	delete(s.secretPending, key)
+	s.detachExactPendingSecretCommandLocked(command)
 	s.mu.Unlock()
 	command.zeroPayload()
 	s.mu.Lock()
@@ -1171,6 +1170,20 @@ func (s *ADMSServer) releaseSecretCommandWriter(command *secretADMSCommand) {
 	s.mu.Unlock()
 }
 
+func (s *ADMSServer) detachExactPendingSecretCommandLocked(
+	command *secretADMSCommand,
+) bool {
+	key := pendingCommandKey{DeviceSN: command.deviceSN, LocalID: command.id}
+	current, exists := s.secretPending[key]
+	if !exists || current != command {
+		return false
+	}
+	command.writerActive = false
+	command.stopDeadlineLocked()
+	delete(s.secretPending, key)
+	return true
+}
+
 func secretCommandWriteTimedOut(err error) bool {
 	var networkError net.Error
 	return errors.As(err, &networkError) && networkError.Timeout()
@@ -1207,14 +1220,8 @@ func (s *ADMSServer) failServedSecretCommand(
 	code string,
 	returnCode int,
 ) {
-	key := pendingCommandKey{DeviceSN: command.deviceSN, LocalID: command.id}
 	s.mu.Lock()
-	current, exists := s.secretPending[key]
-	removed := exists && current == command
-	if removed {
-		command.stopDeadlineLocked()
-		delete(s.secretPending, key)
-	}
+	removed := s.detachExactPendingSecretCommandLocked(command)
 	s.mu.Unlock()
 	if !removed {
 		return
@@ -1242,8 +1249,7 @@ func (s *ADMSServer) completeSecretCommand(
 	s.mu.Lock()
 	command, exists := s.secretPending[key]
 	if exists {
-		command.stopDeadlineLocked()
-		delete(s.secretPending, key)
+		exists = s.detachExactPendingSecretCommandLocked(command)
 	}
 	if !exists {
 		s.mu.Unlock()
@@ -1652,10 +1658,10 @@ func (s *ADMSServer) shutdownBiometricDelivery() {
 		removed = append(removed, queue...)
 		delete(s.secretCmdQueue, deviceSN)
 	}
-	for key, command := range s.secretPending {
-		command.stopDeadlineLocked()
-		removed = append(removed, command)
-		delete(s.secretPending, key)
+	for _, command := range s.secretPending {
+		if s.detachExactPendingSecretCommandLocked(command) {
+			removed = append(removed, command)
+		}
 	}
 	clear(s.secretCmdID)
 	s.mu.Unlock()

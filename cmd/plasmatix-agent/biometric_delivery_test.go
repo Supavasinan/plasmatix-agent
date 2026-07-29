@@ -1519,7 +1519,11 @@ func TestBiometricDeliveryConcurrentPollHasOneWriterAndResponsiveTerminalState(
 ) {
 	tests := []struct {
 		name       string
-		startEvent func(*ADMSServer, *manualSecretClock, int) <-chan struct{}
+		startEvent func(
+			*ADMSServer,
+			*manualSecretClock,
+			*secretADMSCommand,
+		) <-chan struct{}
 		stateReady func(*ADMSServer, pendingCommandKey) bool
 	}{
 		{
@@ -1527,12 +1531,12 @@ func TestBiometricDeliveryConcurrentPollHasOneWriterAndResponsiveTerminalState(
 			startEvent: func(
 				server *ADMSServer,
 				_ *manualSecretClock,
-				localID int,
+				command *secretADMSCommand,
 			) <-chan struct{} {
 				done := make(chan struct{})
 				go func() {
 					server.completeSecretCommand(
-						pendingCommandKey{DeviceSN: "AC1", LocalID: localID},
+						pendingCommandKey{DeviceSN: "AC1", LocalID: command.id},
 						0,
 					)
 					close(done)
@@ -1549,7 +1553,7 @@ func TestBiometricDeliveryConcurrentPollHasOneWriterAndResponsiveTerminalState(
 			startEvent: func(
 				_ *ADMSServer,
 				clock *manualSecretClock,
-				_ int,
+				_ *secretADMSCommand,
 			) <-chan struct{} {
 				done := make(chan struct{})
 				go func() {
@@ -1564,11 +1568,56 @@ func TestBiometricDeliveryConcurrentPollHasOneWriterAndResponsiveTerminalState(
 			},
 		},
 		{
+			name: "supersession",
+			startEvent: func(
+				server *ADMSServer,
+				_ *manualSecretClock,
+				command *secretADMSCommand,
+			) <-chan struct{} {
+				done := make(chan struct{})
+				go func() {
+					server.supersedeSecretDeployment(
+						command.deploymentID,
+						testStaleID,
+					)
+					close(done)
+				}()
+				return done
+			},
+			stateReady: func(server *ADMSServer, key pendingCommandKey) bool {
+				_, pending := server.secretPending[key]
+				return !pending
+			},
+		},
+		{
+			name: "live compatibility failure",
+			startEvent: func(
+				server *ADMSServer,
+				_ *manualSecretClock,
+				command *secretADMSCommand,
+			) <-chan struct{} {
+				done := make(chan struct{})
+				go func() {
+					server.failServedSecretCommand(
+						command,
+						"algorithm_mismatch",
+						-1,
+					)
+					close(done)
+				}()
+				return done
+			},
+			stateReady: func(server *ADMSServer, key pendingCommandKey) bool {
+				_, pending := server.secretPending[key]
+				return !pending
+			},
+		},
+		{
 			name: "shutdown",
 			startEvent: func(
 				server *ADMSServer,
 				_ *manualSecretClock,
-				_ int,
+				_ *secretADMSCommand,
 			) <-chan struct{} {
 				done := make(chan struct{})
 				go func() {
@@ -1649,8 +1698,15 @@ func TestBiometricDeliveryConcurrentPollHasOneWriterAndResponsiveTerminalState(
 			if !second.busy {
 				t.Error("concurrent poll did not receive the immediate retry signal")
 			}
-			if first.serveAttempts != 1 {
-				t.Errorf("concurrent poll incremented serve attempts to %d; want 1", first.serveAttempts)
+			server.mu.Lock()
+			serveAttempts := first.serveAttempts
+			deadlineActive := first.deadlineStop != nil
+			server.mu.Unlock()
+			if serveAttempts != 1 {
+				t.Errorf("concurrent poll incremented serve attempts to %d; want 1", serveAttempts)
+			}
+			if !deadlineActive {
+				t.Error("concurrent poll stopped the pending command deadline")
 			}
 
 			reservationDone := make(chan bool, 1)
@@ -1671,12 +1727,34 @@ func TestBiometricDeliveryConcurrentPollHasOneWriterAndResponsiveTerminalState(
 			}
 
 			key := pendingCommandKey{DeviceSN: "AC1", LocalID: first.id}
-			eventDone := tt.startEvent(server, clock, first.id)
+			eventDone := tt.startEvent(server, clock, first)
 			stateDeadline := time.Now().Add(100 * time.Millisecond)
 			stateResponsive := false
 			for time.Now().Before(stateDeadline) {
 				if server.mu.TryLock() {
 					stateResponsive = tt.stateReady(server, key)
+					if stateResponsive && first.writerActive {
+						server.mu.Unlock()
+						close(firstWriter.release)
+						<-firstDone
+						<-secondDone
+						<-eventDone
+						t.Fatalf(
+							"%s detached the active writer without releasing ownership",
+							tt.name,
+						)
+					}
+					if stateResponsive && first.deadlineStop != nil {
+						server.mu.Unlock()
+						close(firstWriter.release)
+						<-firstDone
+						<-secondDone
+						<-eventDone
+						t.Fatalf(
+							"%s detached the command without stopping its deadline",
+							tt.name,
+						)
+					}
 					server.mu.Unlock()
 					if stateResponsive {
 						break
@@ -1856,9 +1934,17 @@ func TestBiometricDeliverySecretWriteDeadlineDurablyTerminatesAndReleases(
 	server.mu.Lock()
 	_, active := server.secretCmdID[testCommandID]
 	pending := len(server.secretPending)
+	writerActive := command.writerActive
+	deadlineActive := command.deadlineStop != nil
 	server.mu.Unlock()
-	if active || pending != 0 {
-		t.Fatalf("deadline retained active=%v pending=%d", active, pending)
+	if active || pending != 0 || writerActive || deadlineActive {
+		t.Fatalf(
+			"deadline retained active=%v pending=%d writer=%v deadline=%v",
+			active,
+			pending,
+			writerActive,
+			deadlineActive,
+		)
 	}
 
 	shutdownDone := make(chan struct{})

@@ -202,6 +202,7 @@ type ADMSServer struct {
 	secretClosed             bool
 	secretNow                func() time.Time
 	secretAfterFunc          func(time.Duration, func()) func() bool
+	secretWriteTimeout       time.Duration
 }
 
 type ADMSCommand struct {
@@ -515,7 +516,12 @@ func (a *Agent) startADMSServer() {
 
 	addr := fmt.Sprintf(":%d", a.config.ADMSPort)
 	log.Printf("ADMS server listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		WriteTimeout: secretCommandWriteTimeout,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		a.adms.shutdownBiometricUploads()
 		a.adms.shutdownBiometricDelivery()
 		log.Fatalf("ADMS server error: %v", err)

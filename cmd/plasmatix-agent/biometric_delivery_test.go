@@ -1388,6 +1388,191 @@ func (w *blockingSecretResponseWriter) Write(value []byte) (int, error) {
 	return len(value), nil
 }
 
+type secretResponseWriteTimeoutError struct{}
+
+func (secretResponseWriteTimeoutError) Error() string   { return "write deadline exceeded" }
+func (secretResponseWriteTimeoutError) Timeout() bool   { return true }
+func (secretResponseWriteTimeoutError) Temporary() bool { return true }
+
+type deadlineBlockingSecretResponseWriter struct {
+	header       http.Header
+	writes       int
+	started      chan struct{}
+	deadlineOnce sync.Once
+	deadline     chan struct{}
+}
+
+func (w *deadlineBlockingSecretResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *deadlineBlockingSecretResponseWriter) WriteHeader(_ int) {}
+
+func (w *deadlineBlockingSecretResponseWriter) SetWriteDeadline(
+	deadline time.Time,
+) error {
+	if deadline.IsZero() {
+		return nil
+	}
+	time.AfterFunc(time.Until(deadline), func() {
+		w.deadlineOnce.Do(func() {
+			close(w.deadline)
+		})
+	})
+	return nil
+}
+
+func (w *deadlineBlockingSecretResponseWriter) Write(value []byte) (int, error) {
+	w.writes++
+	if w.writes == 1 {
+		return len(value), nil
+	}
+	close(w.started)
+	<-w.deadline
+	return 0, secretResponseWriteTimeoutError{}
+}
+
+func TestBiometricDeliverySecretWriteDeadlineDurablyTerminatesAndReleases(
+	t *testing.T,
+) {
+	outbox, err := openBiometricResultOutbox(t.TempDir())
+	if err != nil {
+		t.Fatalf("open outbox: %v", err)
+	}
+	payload := []byte("mutable-secret-command")
+	command := &secretADMSCommand{
+		deviceSN:     "AC1",
+		deploymentID: testDeploymentID,
+		commandID:    testCommandID,
+		sha256:       strings.Repeat("a", 64),
+		payload:      payload,
+	}
+	server := &ADMSServer{
+		secretCmdQueue:      map[string][]*secretADMSCommand{"AC1": {command}},
+		secretPending:       make(map[pendingCommandKey]*secretADMSCommand),
+		secretCmdID:         map[string]struct{}{testCommandID: {}},
+		resultOutbox:        outbox,
+		resultOutboxStarted: true,
+		secretWriteTimeout:  25 * time.Millisecond,
+	}
+	command = server.popSecretCommand("AC1")
+	writer := &deadlineBlockingSecretResponseWriter{
+		header:   make(http.Header),
+		started:  make(chan struct{}),
+		deadline: make(chan struct{}),
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, writeErr := server.writePendingSecretADMSCommand(writer, command)
+		done <- writeErr
+	}()
+	<-writer.started
+	select {
+	case writeErr := <-done:
+		if writeErr == nil {
+			t.Fatal("deadline-blocked secret write returned no error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("deadline-blocked secret write did not terminate")
+	}
+
+	records := outbox.snapshot()
+	if len(records) != 1 ||
+		records[0].CommandID != testCommandID ||
+		records[0].ErrorCode != "network_unavailable" {
+		t.Fatalf("deadline result = %#v", records)
+	}
+	for index, value := range payload {
+		if value != 0 {
+			t.Fatalf("deadline retained secret payload byte %d", index)
+		}
+	}
+	server.mu.Lock()
+	_, active := server.secretCmdID[testCommandID]
+	pending := len(server.secretPending)
+	server.mu.Unlock()
+	if active || pending != 0 {
+		t.Fatalf("deadline retained active=%v pending=%d", active, pending)
+	}
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		server.shutdownBiometricDelivery()
+		close(shutdownDone)
+	}()
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown stalled after the secret write deadline")
+	}
+}
+
+func TestBiometricDeliveryBlockedWriteDoesNotStallOtherCommandProgress(
+	t *testing.T,
+) {
+	outbox, err := openBiometricResultOutbox(t.TempDir())
+	if err != nil {
+		t.Fatalf("open outbox: %v", err)
+	}
+	command := &secretADMSCommand{
+		deviceSN:     "AC1",
+		deploymentID: testDeploymentID,
+		commandID:    testCommandID,
+		sha256:       strings.Repeat("a", 64),
+		payload:      []byte("mutable-secret-command"),
+	}
+	server := &ADMSServer{
+		secretCmdQueue:      map[string][]*secretADMSCommand{"AC1": {command}},
+		secretPending:       make(map[pendingCommandKey]*secretADMSCommand),
+		secretCmdID:         map[string]struct{}{testCommandID: {}},
+		resultOutbox:        outbox,
+		resultOutboxStarted: true,
+	}
+	command = server.popSecretCommand("AC1")
+	writer := &blockingSecretResponseWriter{
+		header:  make(http.Header),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, writeErr := server.writePendingSecretADMSCommand(writer, command)
+		writeDone <- writeErr
+	}()
+	<-writer.started
+
+	expireDone := make(chan struct{})
+	go func() {
+		server.expirePendingSecretCommand(command)
+		close(expireDone)
+	}()
+	time.Sleep(25 * time.Millisecond)
+
+	reserved := make(chan bool, 1)
+	go func() {
+		ok, _ := server.reserveSecretCommand(testStaleID)
+		reserved <- ok
+	}()
+	select {
+	case ok := <-reserved:
+		if !ok {
+			t.Fatal("unrelated command was refused while one write was blocked")
+		}
+	case <-time.After(100 * time.Millisecond):
+		close(writer.release)
+		<-writeDone
+		<-expireDone
+		t.Fatal("blocked secret I/O stalled unrelated command progress")
+	}
+
+	close(writer.release)
+	if writeErr := <-writeDone; writeErr != nil {
+		t.Fatalf("release blocked write: %v", writeErr)
+	}
+	<-expireDone
+}
+
 func TestBiometricDeliveryShutdownWaitsForSecretResponseWriteBeforeZeroing(
 	t *testing.T,
 ) {
@@ -1440,6 +1625,95 @@ func TestBiometricDeliveryShutdownWaitsForSecretResponseWriteBeforeZeroing(
 			t.Fatalf("command byte %d was not zeroed after response completion", index)
 		}
 	}
+}
+
+func TestBiometricDeliveryRejectsNonCanonicalUUIDsAtEveryIngress(t *testing.T) {
+	canonicalDeploymentID := "abcdefab-cdef-4abc-8def-abcdefabcdea"
+	canonicalCommandID := "abcdefab-cdef-4abc-8def-abcdefabcdef"
+	uppercaseDeploymentID := strings.ToUpper(canonicalDeploymentID)
+	uppercaseCommandID := strings.ToUpper(canonicalCommandID)
+	if validBiometricUUID(uppercaseDeploymentID) ||
+		validBiometricUUID(uppercaseCommandID) {
+		t.Fatal("uppercase UUID text was accepted as canonical")
+	}
+
+	t.Run("reference", func(t *testing.T) {
+		server := &ADMSServer{
+			agent:          &Agent{},
+			secretCmdQueue: make(map[string][]*secretADMSCommand),
+			secretPending:  make(map[pendingCommandKey]*secretADMSCommand),
+			secretCmdID:    make(map[string]struct{}),
+		}
+		if !server.interceptBiometricDeploymentReference("AC1", ADMSCommand{
+			CloudID: uppercaseCommandID,
+			Command: "DEPLOY_BIOMETRIC_ASSET " + uppercaseDeploymentID,
+		}) {
+			t.Fatal("uppercase typed reference was not intercepted")
+		}
+		server.mu.Lock()
+		reservations := len(server.secretCmdID)
+		server.mu.Unlock()
+		if reservations != 0 {
+			t.Fatalf("uppercase typed reference retained %d reservation(s)", reservations)
+		}
+	})
+
+	t.Run("claim", func(t *testing.T) {
+		fixture := newDeliveryFixture([]byte("fingerprint-template"))
+		fixture.claimCommand = uppercaseCommandID
+		cloud := httptest.NewServer(fixture.handler(t))
+		defer cloud.Close()
+		agent, server := newDeliveryAgent(t, cloud.URL)
+		err := agent.ProcessBiometricDeployment(
+			withBiometricDeploymentCommandID(
+				context.Background(),
+				uppercaseCommandID,
+			),
+			testDeploymentID,
+			"AC1",
+		)
+		if err == nil || err.Error() != "stale_deployment_command" {
+			t.Fatalf("uppercase claim command error = %v", err)
+		}
+		fixture.mu.Lock()
+		claims := fixture.claimCount
+		fixture.mu.Unlock()
+		if claims != 0 {
+			t.Fatalf("uppercase command reached claim ingress %d time(s)", claims)
+		}
+		server.mu.Lock()
+		queued := len(server.secretCmdQueue["AC1"])
+		server.mu.Unlock()
+		if queued != 0 {
+			t.Fatal("uppercase claim command queued scanner bytes")
+		}
+	})
+
+	t.Run("result", func(t *testing.T) {
+		outbox, err := openBiometricResultOutbox(t.TempDir())
+		if err != nil {
+			t.Fatalf("open outbox: %v", err)
+		}
+		server := &ADMSServer{
+			secretCmdID:  map[string]struct{}{uppercaseCommandID: {}},
+			resultOutbox: outbox,
+			secretClosed: true,
+		}
+		server.startBiometricResultWorker(
+			testOutboxResult(uppercaseCommandID),
+			testDeploymentID,
+		)
+		if records := outbox.snapshot(); len(records) != 0 {
+			t.Fatalf("uppercase result entered durable outbox: %#v", records)
+		}
+		server.mu.Lock()
+		pending := len(server.resultEnqueuePending)
+		_, active := server.secretCmdID[uppercaseCommandID]
+		server.mu.Unlock()
+		if pending != 0 || active {
+			t.Fatalf("uppercase result retained pending=%d active=%v", pending, active)
+		}
+	})
 }
 
 func TestBiometricDeliveryTerminalEventBeforeWritePreventsEmptyCommandWrite(

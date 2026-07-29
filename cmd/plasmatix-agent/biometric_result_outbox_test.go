@@ -495,6 +495,77 @@ func TestBiometricResultOutboxCommandIDIsGloballyUniqueAcrossDeployments(
 	}
 }
 
+func TestBiometricResultOutboxRejectsUUIDCaseVariantsOnEnqueueAndLoad(
+	t *testing.T,
+) {
+	now := time.Now().UTC()
+	canonicalCommandID := "abcdefab-cdef-4abc-8def-abcdefabcdef"
+	canonicalDeploymentID := "abcdefab-cdef-4abc-8def-abcdefabcdea"
+	uppercaseCommandID := strings.ToUpper(canonicalCommandID)
+	uppercaseDeploymentID := strings.ToUpper(canonicalDeploymentID)
+
+	outbox, err := openBiometricResultOutbox(t.TempDir())
+	if err != nil {
+		t.Fatalf("open outbox: %v", err)
+	}
+	if err := outbox.enqueue(
+		testDeploymentID,
+		testOutboxResult(canonicalCommandID),
+		now,
+	); err != nil {
+		t.Fatalf("enqueue canonical result: %v", err)
+	}
+	if err := outbox.enqueue(
+		testStaleID,
+		testOutboxResult(uppercaseCommandID),
+		now,
+	); err == nil {
+		t.Fatal("case-only command UUID variant coexisted across deployments")
+	}
+	if err := outbox.enqueue(
+		uppercaseDeploymentID,
+		testOutboxResult(testUUIDForIndex(999)),
+		now,
+	); err == nil {
+		t.Fatal("uppercase deployment UUID entered the outbox")
+	}
+
+	stateDir := t.TempDir()
+	document := biometricResultOutboxDocument{
+		Version: biometricResultOutboxVersion,
+		Records: []biometricResultOutboxRecord{
+			outbox.snapshot()[0],
+			{
+				DeploymentID:  testStaleID,
+				CommandID:     uppercaseCommandID,
+				DeviceSN:      "AC1",
+				Status:        "failed",
+				SHA256:        strings.Repeat("a", 64),
+				ErrorCode:     "network_unavailable",
+				ReturnCode:    -1,
+				NextAttemptAt: now,
+			},
+		},
+	}
+	body, err := json.Marshal(document)
+	if err != nil {
+		t.Fatalf("marshal case-variant outbox: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(stateDir, biometricResultOutboxFilename),
+		body,
+		0o600,
+	); err != nil {
+		t.Fatalf("write case-variant outbox: %v", err)
+	}
+	if _, err := openBiometricResultOutbox(stateDir); !errors.Is(
+		err,
+		errBiometricResultOutboxCorrupt,
+	) {
+		t.Fatalf("load case-variant outbox error = %v; want corrupt", err)
+	}
+}
+
 func TestBiometricResultOutboxRetriesLostResponseAndDeletesAfterSuccess(
 	t *testing.T,
 ) {

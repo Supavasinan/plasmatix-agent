@@ -19,18 +19,25 @@ import (
 const testVaultAssetID = "44444444-4444-4444-8444-444444444444"
 
 type deletionFixture struct {
-	t              *testing.T
-	mu             sync.Mutex
-	claims         int
-	rechecks       int
-	payloadFetch   int
-	results        []map[string]any
-	claimStatus    int
-	recheckStatus  int
-	claimBody      map[string]any
-	recheckBody    map[string]any
-	resultFailures int
-	resultReady    chan struct{}
+	t               *testing.T
+	mu              sync.Mutex
+	claims          int
+	rechecks        int
+	payloadFetch    int
+	results         []map[string]any
+	claimStatus     int
+	recheckStatus   int
+	claimBody       map[string]any
+	recheckBody     map[string]any
+	recheckBodies   []map[string]any
+	recheckStatuses []int
+	recheckDelayAt  int
+	recheckDelay    time.Duration
+	recheckBlockAt  int
+	recheckStarted  chan struct{}
+	recheckRelease  chan struct{}
+	resultFailures  int
+	resultReady     chan struct{}
 }
 
 func newDeletionFixture(t *testing.T) *deletionFixture {
@@ -41,13 +48,14 @@ func newDeletionFixture(t *testing.T) *deletionFixture {
 		recheckStatus: http.StatusOK,
 		resultReady:   make(chan struct{}, 4),
 		claimBody: map[string]any{
-			"operation":    "delete",
-			"deploymentId": testDeploymentID,
-			"commandId":    testCommandID,
-			"attempt":      2,
-			"deviceSn":     "AC1",
-			"personnelId":  "14",
-			"vaultAssetId": testVaultAssetID,
+			"operation":      "delete",
+			"deploymentId":   testDeploymentID,
+			"commandId":      testCommandID,
+			"attempt":        2,
+			"leaseExpiresAt": time.Now().Add(30 * time.Second).UnixMilli(),
+			"deviceSn":       "AC1",
+			"personnelId":    "14",
+			"vaultAssetId":   testVaultAssetID,
 			"asset": map[string]any{
 				"kind":      "fingerprint_template",
 				"bioType":   1,
@@ -78,8 +86,9 @@ func (fixture *deletionFixture) handler() http.Handler {
 			fixture.mu.Lock()
 			if recheck, exists := input["recheck"]; exists {
 				fixture.rechecks++
+				attempt := float64(fixture.claimBody["attempt"].(int))
 				want := map[string]any{
-					"attempt":      float64(2),
+					"attempt":      attempt,
 					"vaultAssetId": testVaultAssetID,
 				}
 				if got, ok := recheck.(map[string]any); !ok ||
@@ -94,13 +103,54 @@ func (fixture *deletionFixture) handler() http.Handler {
 			status := fixture.claimStatus
 			if _, rechecking := input["recheck"]; rechecking {
 				status = fixture.recheckStatus
+				if fixture.rechecks <= len(fixture.recheckStatuses) {
+					status = fixture.recheckStatuses[fixture.rechecks-1]
+				}
 			}
 			claim := fixture.claimBody
+			customRecheckBody := false
 			if _, rechecking := input["recheck"]; rechecking &&
 				fixture.recheckBody != nil {
 				claim = fixture.recheckBody
+				customRecheckBody = true
 			}
+			if _, rechecking := input["recheck"]; rechecking &&
+				fixture.rechecks <= len(fixture.recheckBodies) &&
+				fixture.recheckBodies[fixture.rechecks-1] != nil {
+				claim = fixture.recheckBodies[fixture.rechecks-1]
+				customRecheckBody = true
+			}
+			if _, rechecking := input["recheck"]; rechecking &&
+				!customRecheckBody {
+				claim["leaseExpiresAt"] = time.Now().Add(30 * time.Second).UnixMilli()
+			}
+			delay := time.Duration(0)
+			if fixture.rechecks == fixture.recheckDelayAt {
+				delay = fixture.recheckDelay
+			}
+			recheckNumber := fixture.rechecks
 			fixture.mu.Unlock()
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				select {
+				case <-request.Context().Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+			}
+			if recheckNumber == fixture.recheckBlockAt {
+				if fixture.recheckStarted != nil {
+					fixture.recheckStarted <- struct{}{}
+				}
+				if fixture.recheckRelease != nil {
+					select {
+					case <-request.Context().Done():
+						return
+					case <-fixture.recheckRelease:
+					}
+				}
+			}
 			if status != http.StatusOK {
 				w.WriteHeader(status)
 				_, _ = w.Write([]byte(`{"error":"stale_deployment_attempt"}`))
@@ -241,6 +291,20 @@ func TestBiometricDeletionRenderMatrix(t *testing.T) {
 			want: "DATA DELETE BIODATA Pin=14\tNo=3\tType=1",
 		},
 		{
+			name: "TA 2.2.13 algorithm 12 refuses BIODATA",
+			state: DeviceProtocolState{
+				Profile: ProtocolTAPush, Confidence: 90, PushVersion: "2.2.13",
+				Capabilities: map[string]string{
+					"fingerfunon": "1", "biodatafun": "1",
+					"fingeralgorithmversion": "12.0",
+				},
+			},
+			metadata: biometricDeletionMetadata{
+				PersonnelID: "14", Kind: "fingerprint_template", BioType: 1, SlotIndex: 3,
+			},
+			wantCode: "record_type_unsupported",
+		},
+		{
 			name: "AC face template uses BIODATA",
 			state: DeviceProtocolState{
 				Profile: ProtocolACPush3, Confidence: 90,
@@ -366,7 +430,7 @@ func TestBiometricDeletionClaimRecheckQueueAckAndSafeResult(t *testing.T) {
 		t.Fatal("timed out waiting for delete result")
 	}
 	claims, rechecks, payloadFetches, results := fixture.snapshot()
-	if claims != 1 || rechecks != 1 || payloadFetches != 0 || len(results) != 1 {
+	if claims != 1 || rechecks != 2 || payloadFetches != 0 || len(results) != 1 {
 		t.Fatalf(
 			"calls = claims:%d rechecks:%d payload:%d results:%d",
 			claims,
@@ -558,9 +622,234 @@ func TestBiometricDeletionLostScannerResponseRetransmitsIdenticalMutableBytes(
 	if !bytes.HasSuffix(retry.Body.Bytes(), original) {
 		t.Fatal("lost delete response did not retransmit identical mutable bytes")
 	}
-	_, _, _, results := fixture.snapshot()
+	_, rechecks, _, results := fixture.snapshot()
+	if rechecks != 3 {
+		t.Fatalf("generation rechecks = %d; want pre-enqueue plus every serve", rechecks)
+	}
 	if len(results) != 0 {
 		t.Fatalf("lost delete response falsely reported %#v", results)
+	}
+}
+
+func TestBiometricDeletionAttemptFiveRechecksImmediatelyBeforeFirstServe(
+	t *testing.T,
+) {
+	fixture := newDeletionFixture(t)
+	fixture.claimBody["attempt"] = 5
+	cloud := httptest.NewServer(fixture.handler())
+	defer cloud.Close()
+	agent, server := newDeliveryAgent(t, cloud.URL)
+	if err := processTestDeletion(agent, context.Background(), testCommandID); err != nil {
+		t.Fatalf("process attempt-five deletion: %v", err)
+	}
+
+	response := httptest.NewRecorder()
+	server.handleGetRequest(
+		response,
+		httptest.NewRequest(http.MethodGet, "/iclock/getrequest?SN=AC1", nil),
+	)
+	if !strings.Contains(response.Body.String(), "DATA DELETE BIODATA") {
+		t.Fatalf("attempt-five delete was not served after renewal: %q", response.Body.String())
+	}
+	_, rechecks, _, results := fixture.snapshot()
+	if rechecks != 2 || len(results) != 0 {
+		t.Fatalf("attempt-five serve rechecks=%d results=%#v", rechecks, results)
+	}
+}
+
+func TestBiometricDeletionReplacementGenerationAtServeIsDiscardedWithoutResult(
+	t *testing.T,
+) {
+	fixture := newDeletionFixture(t)
+	replacement := cloneDeletionClaim(t, fixture.claimBody)
+	replacement["vaultAssetId"] = "55555555-5555-4555-8555-555555555555"
+	fixture.recheckBodies = []map[string]any{nil, replacement}
+	cloud := httptest.NewServer(fixture.handler())
+	defer cloud.Close()
+	agent, server := newDeliveryAgent(t, cloud.URL)
+	if err := processTestDeletion(agent, context.Background(), testCommandID); err != nil {
+		t.Fatalf("process deletion: %v", err)
+	}
+	commandBuffer := server.secretCmdQueue["AC1"][0].payload
+
+	response := httptest.NewRecorder()
+	server.handleGetRequest(
+		response,
+		httptest.NewRequest(http.MethodGet, "/iclock/getrequest?SN=AC1", nil),
+	)
+	if response.Body.String() != "OK" {
+		t.Fatalf("replacement generation reached scanner: %q", response.Body.String())
+	}
+	server.mu.Lock()
+	_, reserved := server.secretCmdID[testCommandID]
+	server.mu.Unlock()
+	if reserved || len(server.secretPending) != 0 ||
+		len(server.resultOutbox.snapshot()) != 0 {
+		t.Fatal("replacement generation retained capacity or produced a false result")
+	}
+	for index, value := range commandBuffer {
+		if value != 0 {
+			t.Fatalf("replacement-conflicted command byte %d was not zeroed", index)
+		}
+	}
+}
+
+func TestBiometricDeletionPreServeQueueLifetimeExpiresAndReleasesSameID(
+	t *testing.T,
+) {
+	fixture := newDeletionFixture(t)
+	cloud := httptest.NewServer(fixture.handler())
+	defer cloud.Close()
+	agent, server := newDeliveryAgent(t, cloud.URL)
+	clock := newManualSecretClock()
+	clock.now = time.Now().UTC()
+	useManualSecretClock(server, clock)
+	if err := processTestDeletion(agent, context.Background(), testCommandID); err != nil {
+		t.Fatalf("process deletion: %v", err)
+	}
+	commandBuffer := server.secretCmdQueue["AC1"][0].payload
+
+	clock.Advance(25 * time.Second)
+
+	server.mu.Lock()
+	queued := len(server.secretCmdQueue["AC1"])
+	_, reserved := server.secretCmdID[testCommandID]
+	server.mu.Unlock()
+	if queued != 0 || reserved || len(server.resultOutbox.snapshot()) != 0 {
+		t.Fatalf("expired pre-serve delete queued=%d reserved=%v outbox=%d",
+			queued, reserved, len(server.resultOutbox.snapshot()))
+	}
+	for index, value := range commandBuffer {
+		if value != 0 {
+			t.Fatalf("pre-serve-expired command byte %d was not zeroed", index)
+		}
+	}
+	reservedAgain, code := server.reserveSecretCommand(testCommandID)
+	if !reservedAgain || code != "" {
+		t.Fatalf("same-ID redelivery reserved=%v code=%q", reservedAgain, code)
+	}
+}
+
+func TestBiometricDeletionQueueDelayStillRequiresFreshServeRenewal(t *testing.T) {
+	fixture := newDeletionFixture(t)
+	cloud := httptest.NewServer(fixture.handler())
+	defer cloud.Close()
+	agent, server := newDeliveryAgent(t, cloud.URL)
+	clock := newManualSecretClock()
+	clock.now = time.Now().UTC()
+	useManualSecretClock(server, clock)
+	if err := processTestDeletion(agent, context.Background(), testCommandID); err != nil {
+		t.Fatalf("process deletion: %v", err)
+	}
+	clock.Advance(25*time.Second - time.Millisecond)
+	renewed := cloneDeletionClaim(t, fixture.claimBody)
+	renewed["leaseExpiresAt"] = clock.Now().Add(30 * time.Second).UnixMilli()
+	fixture.mu.Lock()
+	fixture.recheckBodies = []map[string]any{nil, renewed}
+	fixture.mu.Unlock()
+
+	response := httptest.NewRecorder()
+	server.handleGetRequest(
+		response,
+		httptest.NewRequest(http.MethodGet, "/iclock/getrequest?SN=AC1", nil),
+	)
+	if !strings.Contains(response.Body.String(), "DATA DELETE BIODATA") {
+		t.Fatalf("live delayed delete was not served: %q", response.Body.String())
+	}
+	_, rechecks, _, _ := fixture.snapshot()
+	if rechecks != 2 {
+		t.Fatalf("delayed first serve rechecks = %d; want 2", rechecks)
+	}
+}
+
+func TestBiometricDeletionExactWriteBoundaryIsNotAuthorized(t *testing.T) {
+	fixture := newDeletionFixture(t)
+	cloud := httptest.NewServer(fixture.handler())
+	defer cloud.Close()
+	agent, server := newDeliveryAgent(t, cloud.URL)
+	clock := newManualSecretClock()
+	clock.now = time.Now().UTC()
+	useManualSecretClock(server, clock)
+	if err := processTestDeletion(agent, context.Background(), testCommandID); err != nil {
+		t.Fatalf("process deletion: %v", err)
+	}
+	boundary := cloneDeletionClaim(t, fixture.claimBody)
+	boundary["leaseExpiresAt"] = clock.Now().
+		Add(secretCommandWriteTimeout).UnixMilli()
+	fixture.mu.Lock()
+	fixture.recheckBodies = []map[string]any{nil, boundary}
+	fixture.mu.Unlock()
+
+	response := httptest.NewRecorder()
+	server.handleGetRequest(
+		response,
+		httptest.NewRequest(http.MethodGet, "/iclock/getrequest?SN=AC1", nil),
+	)
+	if response.Body.String() != "OK" {
+		t.Fatalf("exact-boundary lease authorized scanner write: %q", response.Body.String())
+	}
+	if len(server.secretPending) != 1 {
+		t.Fatal("retryable exact-boundary renewal did not retain pending command")
+	}
+}
+
+func TestBiometricDeletionServeRecheckNetworkFailureRetriesWithoutMutation(
+	t *testing.T,
+) {
+	fixture := newDeletionFixture(t)
+	fixture.recheckStatuses = []int{http.StatusOK, http.StatusInternalServerError}
+	cloud := httptest.NewServer(fixture.handler())
+	defer cloud.Close()
+	agent, server := newDeliveryAgent(t, cloud.URL)
+	if err := processTestDeletion(agent, context.Background(), testCommandID); err != nil {
+		t.Fatalf("process deletion: %v", err)
+	}
+
+	first := httptest.NewRecorder()
+	server.handleGetRequest(
+		first,
+		httptest.NewRequest(http.MethodGet, "/iclock/getrequest?SN=AC1", nil),
+	)
+	if first.Body.String() != "OK" || len(server.secretPending) != 1 {
+		t.Fatalf("failed renewal mutated scanner or lost retry: %q", first.Body.String())
+	}
+	_, _, _, results := fixture.snapshot()
+	if len(results) != 0 {
+		t.Fatalf("failed renewal posted false result %#v", results)
+	}
+
+	second := httptest.NewRecorder()
+	server.handleGetRequest(
+		second,
+		httptest.NewRequest(http.MethodGet, "/iclock/getrequest?SN=AC1", nil),
+	)
+	if !strings.Contains(second.Body.String(), "DATA DELETE BIODATA") {
+		t.Fatalf("renewal retry did not serve delete: %q", second.Body.String())
+	}
+}
+
+func TestBiometricDeletionServeRecheckHTTPIsBounded(t *testing.T) {
+	fixture := newDeletionFixture(t)
+	fixture.recheckDelayAt = 2
+	fixture.recheckDelay = 6 * time.Second
+	cloud := httptest.NewServer(fixture.handler())
+	defer cloud.Close()
+	agent, server := newDeliveryAgent(t, cloud.URL)
+	if err := processTestDeletion(agent, context.Background(), testCommandID); err != nil {
+		t.Fatalf("process deletion: %v", err)
+	}
+
+	started := time.Now()
+	response := httptest.NewRecorder()
+	server.handleGetRequest(
+		response,
+		httptest.NewRequest(http.MethodGet, "/iclock/getrequest?SN=AC1", nil),
+	)
+	if elapsed := time.Since(started); elapsed >= 6*time.Second {
+		t.Fatalf("serve renewal latency = %s; want bounded below 6s", elapsed)
+	}
+	if response.Body.String() != "OK" {
+		t.Fatalf("timed-out renewal mutated scanner: %q", response.Body.String())
 	}
 }
 
@@ -613,6 +902,7 @@ func TestBiometricDeletionScannerTimeoutZerosAndReportsGeneration(t *testing.T) 
 	defer cloud.Close()
 	agent, server := newDeliveryAgent(t, cloud.URL)
 	clock := newManualSecretClock()
+	clock.now = time.Now().UTC()
 	useManualSecretClock(server, clock)
 	if err := processTestDeletion(agent, context.Background(), testCommandID); err != nil {
 		t.Fatalf("process deletion: %v", err)
@@ -731,6 +1021,26 @@ func TestBiometricDeletionRejectsInvalidMetadata(t *testing.T) {
 		{"wrong command", func(claim map[string]any) { claim["commandId"] = testStaleID }},
 		{"wrong device", func(claim map[string]any) { claim["deviceSn"] = "OTHER" }},
 		{"invalid attempt", func(claim map[string]any) { claim["attempt"] = 0 }},
+		{"missing lease expiry", func(claim map[string]any) {
+			delete(claim, "leaseExpiresAt")
+		}},
+		{"string lease expiry", func(claim map[string]any) {
+			claim["leaseExpiresAt"] = strconv.FormatInt(
+				time.Now().Add(30*time.Second).UnixMilli(),
+				10,
+			)
+		}},
+		{"fractional lease expiry", func(claim map[string]any) {
+			claim["leaseExpiresAt"] = float64(
+				time.Now().Add(30*time.Second).UnixMilli(),
+			) + 0.5
+		}},
+		{"zero lease expiry", func(claim map[string]any) {
+			claim["leaseExpiresAt"] = 0
+		}},
+		{"expired lease expiry", func(claim map[string]any) {
+			claim["leaseExpiresAt"] = time.Now().Add(-time.Millisecond).UnixMilli()
+		}},
 		{"invalid generation", func(claim map[string]any) { claim["vaultAssetId"] = "asset" }},
 		{"invalid PIN", func(claim map[string]any) { claim["personnelId"] = "14\tDROP" }},
 		{"invalid slot", func(claim map[string]any) {
@@ -760,6 +1070,134 @@ func TestBiometricDeletionRejectsInvalidMetadata(t *testing.T) {
 				t.Fatal("invalid metadata admitted a delete command")
 			}
 		})
+	}
+}
+
+func TestBiometricDeletionFullCapacityRetriesWithoutClaimOrTerminalResult(
+	t *testing.T,
+) {
+	fixture := newDeletionFixture(t)
+	cloud := httptest.NewServer(fixture.handler())
+	defer cloud.Close()
+	agent, server := newDeliveryAgent(t, cloud.URL)
+	server.mu.Lock()
+	for index := 0; index < maxSecretADMSCommands; index++ {
+		server.secretCmdID[testUUIDForIndex(index+900)] = struct{}{}
+	}
+	server.mu.Unlock()
+
+	err := processTestDeletion(agent, context.Background(), testCommandID)
+	if deliveryErrorCode(err) != "network_unavailable" {
+		t.Fatalf("full-capacity error = %v; want retryable network_unavailable", err)
+	}
+	claims, rechecks, _, results := fixture.snapshot()
+	if claims != 0 || rechecks != 0 || len(results) != 0 {
+		t.Fatalf("full capacity claims=%d rechecks=%d results=%#v",
+			claims, rechecks, results)
+	}
+}
+
+func TestBiometricDeletionACKBeforeFirstServeRenewalCannotApply(t *testing.T) {
+	fixture := newDeletionFixture(t)
+	fixture.recheckBlockAt = 2
+	fixture.recheckStarted = make(chan struct{}, 1)
+	fixture.recheckRelease = make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() {
+		releaseOnce.Do(func() {
+			close(fixture.recheckRelease)
+		})
+	})
+	cloud := httptest.NewServer(fixture.handler())
+	defer cloud.Close()
+	agent, server := newDeliveryAgent(t, cloud.URL)
+	if err := processTestDeletion(agent, context.Background(), testCommandID); err != nil {
+		t.Fatalf("process deletion: %v", err)
+	}
+
+	serveDone := make(chan string, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		server.handleGetRequest(
+			response,
+			httptest.NewRequest(http.MethodGet, "/iclock/getrequest?SN=AC1", nil),
+		)
+		serveDone <- response.Body.String()
+	}()
+	select {
+	case <-fixture.recheckStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first serve did not enter renewal recheck")
+	}
+	server.mu.Lock()
+	var localID int
+	for key := range server.secretPending {
+		localID = key.LocalID
+	}
+	server.mu.Unlock()
+	if localID == 0 {
+		t.Fatal("first serve did not reserve a local command ID")
+	}
+	handled, accepted := server.handleSecretDeviceCommandACK(
+		"AC1",
+		[]byte("ID="+strconv.Itoa(localID)+"&Return=0"),
+	)
+	if !handled || accepted {
+		t.Fatalf("pre-renewal ACK handled=%v accepted=%v; want true,false",
+			handled, accepted)
+	}
+	if len(server.resultOutbox.snapshot()) != 0 {
+		t.Fatal("pre-renewal ACK produced a false applied result")
+	}
+
+	releaseOnce.Do(func() {
+		close(fixture.recheckRelease)
+	})
+	select {
+	case response := <-serveDone:
+		if !strings.Contains(response, "DATA DELETE BIODATA") {
+			t.Fatalf("renewed first serve response = %q", response)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("renewed first serve did not complete")
+	}
+	_, accepted = server.handleSecretDeviceCommandACK(
+		"AC1",
+		[]byte("ID="+strconv.Itoa(localID)+"&Return=0"),
+	)
+	if !accepted {
+		t.Fatal("post-serve ACK was not accepted")
+	}
+}
+
+func TestBiometricDeletionRejectsExponentLeaseExpiry(t *testing.T) {
+	expiry := strconv.FormatInt(time.Now().Add(30*time.Second).UnixMilli(), 10)
+	body := `{"deployments":[{"operation":"delete","deploymentId":"` +
+		testDeploymentID + `","commandId":"` + testCommandID +
+		`","attempt":2,"leaseExpiresAt":` + expiry[:1] + `e` +
+		strconv.Itoa(len(expiry)-1) +
+		`,"deviceSn":"AC1","personnelId":"14","vaultAssetId":"` +
+		testVaultAssetID +
+		`","asset":{"kind":"fingerprint_template","bioType":1,"slotIndex":3}}]}`
+	cloud := httptest.NewServer(http.HandlerFunc(func(
+		writer http.ResponseWriter,
+		_ *http.Request,
+	) {
+		writer.Header().Set("Cache-Control", "no-store")
+		_, _ = io.WriteString(writer, body)
+	}))
+	defer cloud.Close()
+	agent, _ := newDeliveryAgent(t, cloud.URL)
+
+	_, err := agent.claimBiometricDeletion(
+		context.Background(),
+		testDeploymentID,
+		"AC1",
+		testCommandID,
+		nil,
+	)
+	if deliveryErrorCode(err) != "invalid_deployment_claim" {
+		t.Fatalf("exponent lease expiry error = %v; want invalid_deployment_claim", err)
 	}
 }
 
@@ -867,7 +1305,8 @@ func TestBiometricDeletionOutboxRecordRejectsSecretFieldsAndPreservesGeneration(
 	}
 	body := mustReadTestFile(t, outbox.path)
 	for _, forbidden := range []string{
-		"personnelId", "payload", "deliveryToken", "DATA DELETE", `"pin"`,
+		"personnelId", "payload", "deliveryToken", "leaseExpiresAt",
+		"DATA DELETE", `"pin"`,
 	} {
 		if bytes.Contains(body, []byte(forbidden)) {
 			t.Fatalf("persisted outbox contains forbidden field %q: %s", forbidden, body)
@@ -964,6 +1403,18 @@ func TestBiometricDeletionOutboxRejectsCorruptGenerationMetadata(t *testing.T) {
 			`","operation":"delete","commandId":"` + testCommandID +
 			`","attempt":2,"vaultAssetId":"` + testVaultAssetID +
 			`","deviceSn":"AC1","status":"failed","errorCode":"device_command_failed","returnCode":2147483648,"attempts":0,"nextAttemptAt":"2026-07-30T00:00:00Z"}]}`,
+		`{"version":1,"records":[{"deploymentId":"` + testDeploymentID +
+			`","operation":"delete","commandId":"` + testCommandID +
+			`","attempt":2,"vaultAssetId":"` + testVaultAssetID +
+			`","deviceSn":"AC1","status":"applied","returnCode":7,"attempts":0,"nextAttemptAt":"2026-07-30T00:00:00Z"}]}`,
+		`{"version":1,"records":[{"deploymentId":"` + testDeploymentID +
+			`","operation":"delete","commandId":"` + testCommandID +
+			`","attempt":2,"vaultAssetId":"` + testVaultAssetID +
+			`","deviceSn":"AC1","status":"applied","errorCode":"device_command_failed","returnCode":0,"attempts":0,"nextAttemptAt":"2026-07-30T00:00:00Z"}]}`,
+		`{"version":1,"records":[{"deploymentId":"` + testDeploymentID +
+			`","operation":"delete","commandId":"` + testCommandID +
+			`","attempt":2,"vaultAssetId":"` + testVaultAssetID +
+			`","deviceSn":"AC1","status":"failed","returnCode":0,"attempts":0,"nextAttemptAt":"2026-07-30T00:00:00Z"}]}`,
 	}
 	for index, document := range tests {
 		t.Run(strconv.Itoa(index), func(t *testing.T) {
@@ -977,6 +1428,41 @@ func TestBiometricDeletionOutboxRejectsCorruptGenerationMetadata(t *testing.T) {
 				errBiometricResultOutboxCorrupt,
 			) {
 				t.Fatalf("open corrupt outbox error = %v", err)
+			}
+		})
+	}
+}
+
+func TestBiometricDeletionOutboxRejectsSemanticallyCorruptEnqueue(t *testing.T) {
+	tests := []biometricDeploymentResult{
+		{
+			Operation: "delete", Status: "applied", DeviceSN: "AC1",
+			CommandID: testCommandID, Attempt: 2, VaultAssetID: testVaultAssetID,
+			ReturnCode: 7,
+		},
+		{
+			Operation: "delete", Status: "applied", DeviceSN: "AC1",
+			CommandID: testCommandID, Attempt: 2, VaultAssetID: testVaultAssetID,
+			ErrorCode: "device_command_failed", ReturnCode: 0,
+		},
+		{
+			Operation: "delete", Status: "failed", DeviceSN: "AC1",
+			CommandID: testCommandID, Attempt: 2, VaultAssetID: testVaultAssetID,
+			ReturnCode: 0,
+		},
+	}
+	for index, result := range tests {
+		t.Run(strconv.Itoa(index), func(t *testing.T) {
+			outbox, err := openBiometricResultOutbox(t.TempDir())
+			if err != nil {
+				t.Fatalf("open outbox: %v", err)
+			}
+			if err := outbox.enqueue(
+				testDeploymentID,
+				result,
+				time.Now(),
+			); !errors.Is(err, errBiometricResultOutboxCorrupt) {
+				t.Fatalf("semantic corruption enqueue error = %v", err)
 			}
 		})
 	}

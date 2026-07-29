@@ -18,16 +18,18 @@ import (
 )
 
 const (
-	maxSecretADMSCommands         = 16
-	maxSecretACKBodyBytes         = 256
-	maxDeviceCommandACKBodyBytes  = 4 * 1024
-	maxSecretCommandServeAttempts = 3
-	secretCommandServeDeadline    = 30 * time.Second
-	secretCommandWriteTimeout     = 20 * time.Second
-	maxBiometricClaimBodyBytes    = 64 * 1024
-	maxBiometricErrorBodyBytes    = 4 * 1024
-	biometricResultHTTPTimeout    = 10 * time.Second
-	biometricDeliveryHTTPTimeout  = 15 * time.Second
+	maxSecretADMSCommands           = 16
+	maxSecretACKBodyBytes           = 256
+	maxDeviceCommandACKBodyBytes    = 4 * 1024
+	maxSecretCommandServeAttempts   = 3
+	secretCommandServeDeadline      = 30 * time.Second
+	secretCommandWriteTimeout       = 20 * time.Second
+	maxBiometricClaimBodyBytes      = 64 * 1024
+	maxBiometricErrorBodyBytes      = 4 * 1024
+	biometricResultHTTPTimeout      = 10 * time.Second
+	biometricDeliveryHTTPTimeout    = 15 * time.Second
+	biometricDeletionRecheckTimeout = 5 * time.Second
+	secretDeletePreServeLifetime    = 25 * time.Second
 )
 
 type biometricDeploymentCommandContextKey struct{}
@@ -92,6 +94,7 @@ type secretADMSCommand struct {
 	operation      string
 	attempt        int
 	vaultAssetID   string
+	leaseExpiresAt canonicalUnixMillis
 	sha256         string
 	metadata       biometricDeploymentMetadata
 	deleteMetadata biometricDeletionMetadata
@@ -100,8 +103,18 @@ type secretADMSCommand struct {
 	firstServedAt  time.Time
 	serveAttempts  int
 	deadlineStop   func() bool
+	preServeStop   func() bool
 	writerActive   bool
+	served         bool
 }
+
+type secretCommandEnqueueOutcome uint8
+
+const (
+	secretCommandEnqueued secretCommandEnqueueOutcome = iota
+	secretCommandEnqueueClosed
+	secretCommandEnqueueFull
+)
 
 func (command *secretADMSCommand) zeroPayload() {
 	command.payloadMu.Lock()
@@ -385,21 +398,23 @@ func (a *Agent) ProcessBiometricDeletion(
 		return deliveryError("deployment_cancelled")
 	}
 
-	queued := a.adms.enqueueSecretCommand(&secretADMSCommand{
+	enqueueOutcome := a.adms.enqueueSecretCommand(&secretADMSCommand{
 		deviceSN:       deviceSN,
 		deploymentID:   deploymentID,
 		commandID:      commandID,
 		operation:      "delete",
 		attempt:        claimed.Attempt,
 		vaultAssetID:   claimed.VaultAssetID,
+		leaseExpiresAt: rechecked.LeaseExpiresAt,
 		deleteMetadata: metadata,
 		payload:        rendered,
 	})
-	if !queued {
-		err = deliveryError("secret_command_queue_full")
-		retainReservation = true
-		a.reportBiometricDeletionFailure(ctx, claimed, deliveryErrorCode(err))
-		return err
+	switch enqueueOutcome {
+	case secretCommandEnqueued:
+	case secretCommandEnqueueClosed:
+		return deliveryError("deployment_cancelled")
+	case secretCommandEnqueueFull:
+		return deliveryError("network_unavailable")
 	}
 	renderedOwnedByQueue = true
 	retainReservation = true
@@ -545,7 +560,7 @@ func (a *Agent) ProcessBiometricDeployment(
 		return deliveryError("deployment_cancelled")
 	}
 
-	queued := a.adms.enqueueSecretCommand(&secretADMSCommand{
+	enqueueOutcome := a.adms.enqueueSecretCommand(&secretADMSCommand{
 		deviceSN:     deviceSN,
 		deploymentID: deploymentID,
 		commandID:    commandID,
@@ -553,20 +568,16 @@ func (a *Agent) ProcessBiometricDeployment(
 		metadata:     metadata,
 		payload:      rendered,
 	})
-	if !queued {
+	switch enqueueOutcome {
+	case secretCommandEnqueued:
+	case secretCommandEnqueueClosed:
 		zeroBytes(rendered)
 		zeroBytes(payload)
-		err = deliveryError("secret_command_queue_full")
-		retainReservation = true
-		a.reportBiometricDeploymentFailure(
-			ctx,
-			deploymentID,
-			deviceSN,
-			commandID,
-			metadata.SHA256,
-			deliveryErrorCode(err),
-		)
-		return err
+		return deliveryError("deployment_cancelled")
+	case secretCommandEnqueueFull:
+		zeroBytes(rendered)
+		zeroBytes(payload)
+		return deliveryError("network_unavailable")
 	}
 
 	retainReservation = true
@@ -647,15 +658,36 @@ type biometricDeletionRecheck struct {
 	VaultAssetID string `json:"vaultAssetId"`
 }
 
+type canonicalUnixMillis int64
+
+func (value *canonicalUnixMillis) UnmarshalJSON(body []byte) error {
+	if len(body) == 0 || len(body) > 19 ||
+		(len(body) > 1 && body[0] == '0') {
+		return errors.New("invalid canonical unix milliseconds")
+	}
+	for _, character := range body {
+		if character < '0' || character > '9' {
+			return errors.New("invalid canonical unix milliseconds")
+		}
+	}
+	parsed, err := strconv.ParseInt(string(body), 10, 64)
+	if err != nil || parsed <= 0 {
+		return errors.New("invalid canonical unix milliseconds")
+	}
+	*value = canonicalUnixMillis(parsed)
+	return nil
+}
+
 type claimedBiometricDeletion struct {
-	Operation    string `json:"operation"`
-	DeploymentID string `json:"deploymentId"`
-	CommandID    string `json:"commandId"`
-	Attempt      int    `json:"attempt"`
-	DeviceSN     string `json:"deviceSn"`
-	PersonnelID  string `json:"personnelId"`
-	VaultAssetID string `json:"vaultAssetId"`
-	Asset        struct {
+	Operation      string              `json:"operation"`
+	DeploymentID   string              `json:"deploymentId"`
+	CommandID      string              `json:"commandId"`
+	Attempt        int                 `json:"attempt"`
+	LeaseExpiresAt canonicalUnixMillis `json:"leaseExpiresAt"`
+	DeviceSN       string              `json:"deviceSn"`
+	PersonnelID    string              `json:"personnelId"`
+	VaultAssetID   string              `json:"vaultAssetId"`
+	Asset          struct {
 		Kind      string `json:"kind"`
 		BioType   int    `json:"bioType"`
 		SlotIndex int    `json:"slotIndex"`
@@ -699,12 +731,23 @@ func (a *Agent) claimBiometricDeletion(
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-API-Key", a.config.APIKey)
-	response, err := cloudHTTPClient(biometricDeliveryHTTPTimeout).Do(request)
+	timeout := biometricDeliveryHTTPTimeout
+	if recheck != nil {
+		timeout = biometricDeletionRecheckTimeout
+	}
+	response, err := cloudHTTPClient(timeout).Do(request)
 	if err != nil {
 		return nil, classifyBiometricRequestError(ctx, "network_unavailable")
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
+		if response.StatusCode >= http.StatusInternalServerError {
+			_, _ = io.Copy(
+				io.Discard,
+				io.LimitReader(response.Body, maxBiometricErrorBodyBytes),
+			)
+			return nil, deliveryError("network_unavailable")
+		}
 		return nil, biometricHTTPError(response, "deployment_claim_failed")
 	}
 	if !exactBiometricHeader(response.Header, "Cache-Control", "no-store") {
@@ -753,6 +796,9 @@ func (a *Agent) claimBiometricDeletion(
 	if !validClaimedBiometricDeletion(claimed, deploymentID, deviceSN) {
 		return nil, deliveryError("invalid_deployment_claim")
 	}
+	if int64(claimed.LeaseExpiresAt) <= time.Now().UnixMilli() {
+		return nil, deliveryError("invalid_deployment_claim")
+	}
 	if recheck != nil &&
 		(claimed.Attempt != recheck.Attempt ||
 			claimed.VaultAssetID != recheck.VaultAssetID) {
@@ -773,6 +819,7 @@ func validClaimedBiometricDeletion(
 		!validBiometricUUID(claimed.VaultAssetID) ||
 		claimed.Attempt < 1 ||
 		claimed.Attempt > 5 ||
+		claimed.LeaseExpiresAt <= 0 ||
 		!validDeliveryIdentifier(claimed.PersonnelID) ||
 		claimed.Asset.SlotIndex < 0 ||
 		claimed.Asset.SlotIndex > 9 {
@@ -1037,6 +1084,9 @@ func validateLiveBiometricDeletion(
 			return "finger_legacy", ""
 		}
 		if capabilities["biodatafun"] != "1" {
+			return "", "record_type_unsupported"
+		}
+		if comparePushVersion(taVersion, [3]int{2, 2, 14}) < 0 {
 			return "", "record_type_unsupported"
 		}
 		return "biodata", ""
@@ -1376,10 +1426,10 @@ func (s *ADMSServer) reserveSecretCommand(commandID string) (bool, string) {
 	); pendingResult {
 		return false, ""
 	} else if !capacity {
-		return false, "secret_command_queue_full"
+		return false, "network_unavailable"
 	}
 	if len(s.secretCmdID) >= maxSecretADMSCommands {
-		return false, "secret_command_queue_full"
+		return false, "network_unavailable"
 	}
 	s.secretCmdID[commandID] = struct{}{}
 	return true, ""
@@ -1391,20 +1441,25 @@ func (s *ADMSServer) releaseSecretCommand(commandID string) {
 	s.mu.Unlock()
 }
 
-func (s *ADMSServer) enqueueSecretCommand(command *secretADMSCommand) bool {
+func (s *ADMSServer) enqueueSecretCommand(
+	command *secretADMSCommand,
+) secretCommandEnqueueOutcome {
 	if command == nil ||
 		!validBiometricUUID(command.deploymentID) ||
 		!validBiometricUUID(command.commandID) ||
 		!validDeliveryIdentifier(command.deviceSN) {
-		return false
+		return secretCommandEnqueueClosed
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.secretClosed {
-		return false
+		return secretCommandEnqueueClosed
 	}
 	if _, reserved := s.secretCmdID[command.commandID]; !reserved {
-		return false
+		return secretCommandEnqueueFull
+	}
+	if len(s.secretCmdID) > maxSecretADMSCommands {
+		return secretCommandEnqueueFull
 	}
 	if s.secretCmdQueue == nil {
 		s.secretCmdQueue = make(map[string][]*secretADMSCommand)
@@ -1415,7 +1470,58 @@ func (s *ADMSServer) enqueueSecretCommand(command *secretADMSCommand) bool {
 		s.secretCmdQueue[command.deviceSN],
 		command,
 	)
-	return true
+	if command.operation == "delete" {
+		s.scheduleDeletePreServeDeadlineLocked(command)
+	}
+	return secretCommandEnqueued
+}
+
+func (s *ADMSServer) scheduleDeletePreServeDeadlineLocked(
+	command *secretADMSCommand,
+) {
+	callback := func() {
+		s.expireQueuedDeleteCommand(command)
+	}
+	if s.secretAfterFunc != nil {
+		command.preServeStop = s.secretAfterFunc(
+			secretDeletePreServeLifetime,
+			callback,
+		)
+		return
+	}
+	timer := time.AfterFunc(secretDeletePreServeLifetime, callback)
+	command.preServeStop = timer.Stop
+}
+
+func (command *secretADMSCommand) stopPreServeDeadlineLocked() {
+	if command.preServeStop != nil {
+		command.preServeStop()
+		command.preServeStop = nil
+	}
+}
+
+func (s *ADMSServer) expireQueuedDeleteCommand(command *secretADMSCommand) {
+	s.mu.Lock()
+	queue := s.secretCmdQueue[command.deviceSN]
+	removed := false
+	for index, current := range queue {
+		if current != command {
+			continue
+		}
+		command.preServeStop = nil
+		s.secretCmdQueue[command.deviceSN] = append(
+			queue[:index],
+			queue[index+1:]...,
+		)
+		removed = true
+		break
+	}
+	s.mu.Unlock()
+	if !removed {
+		return
+	}
+	command.zeroPayload()
+	s.releaseSecretCommand(command.commandID)
 }
 
 func (s *ADMSServer) supersedeSecretDeployment(
@@ -1429,6 +1535,7 @@ func (s *ADMSServer) supersedeSecretDeployment(
 		for _, command := range queue {
 			if command.deploymentID == deploymentID &&
 				command.commandID != currentCommandID {
+				command.stopPreServeDeadlineLocked()
 				removed = append(removed, command)
 				continue
 			}
@@ -1504,6 +1611,7 @@ func (s *ADMSServer) claimSecretCommandWriter(
 	}
 	command := queue[0]
 	s.secretCmdQueue[deviceSN] = queue[1:]
+	command.stopPreServeDeadlineLocked()
 	if s.secretPending == nil {
 		s.secretPending = make(map[pendingCommandKey]*secretADMSCommand)
 	}
@@ -1601,6 +1709,46 @@ func (s *ADMSServer) writePendingSecretADMSCommand(
 	w http.ResponseWriter,
 	command *secretADMSCommand,
 ) (bool, error) {
+	return s.writePendingSecretADMSCommandContext(
+		context.Background(),
+		w,
+		command,
+	)
+}
+
+func (s *ADMSServer) writePendingSecretADMSCommandContext(
+	ctx context.Context,
+	w http.ResponseWriter,
+	command *secretADMSCommand,
+) (bool, error) {
+	if command.operation == "delete" {
+		rechecked, err := s.recheckDeleteImmediatelyBeforeServe(ctx, command)
+		if err != nil {
+			code := deliveryErrorCode(err)
+			switch code {
+			case "network_unavailable", "deployment_claim_failed":
+				s.releaseSecretCommandWriter(command)
+			default:
+				s.discardSecretCommandWithoutResult(command)
+			}
+			return false, nil
+		}
+		writeTimeout := s.secretCommandWriteLimit()
+		if !deleteLeaseBoundsWrite(
+			rechecked.LeaseExpiresAt,
+			s.secretCommandNow(),
+			writeTimeout,
+		) {
+			s.releaseSecretCommandWriter(command)
+			return false, nil
+		}
+		if code := s.queuedSecretCommandCompatibility(command); code != "" {
+			s.failServedSecretCommand(command, code, -1)
+			return false, nil
+		}
+		command.leaseExpiresAt = rechecked.LeaseExpiresAt
+	}
+
 	key := pendingCommandKey{DeviceSN: command.deviceSN, LocalID: command.id}
 	command.payloadMu.Lock()
 	s.mu.Lock()
@@ -1618,10 +1766,7 @@ func (s *ADMSServer) writePendingSecretADMSCommand(
 	}
 	s.mu.Unlock()
 
-	writeTimeout := s.secretWriteTimeout
-	if writeTimeout <= 0 {
-		writeTimeout = secretCommandWriteTimeout
-	}
+	writeTimeout := s.secretCommandWriteLimit()
 	controller := http.NewResponseController(w)
 	_ = controller.SetWriteDeadline(time.Now().Add(writeTimeout))
 	err := writeSecretADMSCommandLocked(w, command)
@@ -1638,14 +1783,94 @@ func (s *ADMSServer) writePendingSecretADMSCommand(
 		}
 		return false, err
 	}
-	s.releaseSecretCommandWriter(command)
+	s.markSecretCommandServed(command)
 	return true, nil
+}
+
+func (s *ADMSServer) secretCommandWriteLimit() time.Duration {
+	if s.secretWriteTimeout > 0 {
+		return s.secretWriteTimeout
+	}
+	return secretCommandWriteTimeout
+}
+
+func deleteLeaseBoundsWrite(
+	expiresAt canonicalUnixMillis,
+	now time.Time,
+	writeTimeout time.Duration,
+) bool {
+	if expiresAt <= 0 || writeTimeout <= 0 {
+		return false
+	}
+	return int64(expiresAt) > now.Add(writeTimeout).UnixMilli()
+}
+
+func (s *ADMSServer) recheckDeleteImmediatelyBeforeServe(
+	ctx context.Context,
+	command *secretADMSCommand,
+) (*claimedBiometricDeletion, error) {
+	if s.agent == nil {
+		return nil, deliveryError("deployment_delivery_unavailable")
+	}
+	rechecked, err := s.agent.claimBiometricDeletion(
+		ctx,
+		command.deploymentID,
+		command.deviceSN,
+		command.commandID,
+		&biometricDeletionRecheck{
+			Attempt:      command.attempt,
+			VaultAssetID: command.vaultAssetID,
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	expected := &claimedBiometricDeletion{
+		Operation:      "delete",
+		DeploymentID:   command.deploymentID,
+		CommandID:      command.commandID,
+		Attempt:        command.attempt,
+		LeaseExpiresAt: command.leaseExpiresAt,
+		DeviceSN:       command.deviceSN,
+		PersonnelID:    command.deleteMetadata.PersonnelID,
+		VaultAssetID:   command.vaultAssetID,
+	}
+	expected.Asset.Kind = command.deleteMetadata.Kind
+	expected.Asset.BioType = command.deleteMetadata.BioType
+	expected.Asset.SlotIndex = command.deleteMetadata.SlotIndex
+	if !sameClaimedBiometricDeletion(expected, rechecked) {
+		return nil, deliveryError("stale_deployment_attempt")
+	}
+	return rechecked, nil
+}
+
+func (s *ADMSServer) discardSecretCommandWithoutResult(
+	command *secretADMSCommand,
+) {
+	s.mu.Lock()
+	removed := s.detachExactPendingSecretCommandLocked(command)
+	s.mu.Unlock()
+	if !removed {
+		return
+	}
+	command.zeroPayload()
+	s.releaseSecretCommand(command.commandID)
 }
 
 func (s *ADMSServer) releaseSecretCommandWriter(command *secretADMSCommand) {
 	key := pendingCommandKey{DeviceSN: command.deviceSN, LocalID: command.id}
 	s.mu.Lock()
 	if current, exists := s.secretPending[key]; exists && current == command {
+		command.writerActive = false
+	}
+	s.mu.Unlock()
+}
+
+func (s *ADMSServer) markSecretCommandServed(command *secretADMSCommand) {
+	key := pendingCommandKey{DeviceSN: command.deviceSN, LocalID: command.id}
+	s.mu.Lock()
+	if current, exists := s.secretPending[key]; exists && current == command {
+		command.served = true
 		command.writerActive = false
 	}
 	s.mu.Unlock()
@@ -1726,6 +1951,10 @@ func (s *ADMSServer) completeSecretCommand(
 ) bool {
 	s.mu.Lock()
 	command, exists := s.secretPending[key]
+	if exists && command.operation == "delete" && !command.served {
+		s.mu.Unlock()
+		return false
+	}
 	if exists {
 		exists = s.detachExactPendingSecretCommandLocked(command)
 	}
@@ -2147,6 +2376,9 @@ func (s *ADMSServer) shutdownBiometricDelivery() {
 	}
 	var removed []*secretADMSCommand
 	for deviceSN, queue := range s.secretCmdQueue {
+		for _, command := range queue {
+			command.stopPreServeDeadlineLocked()
+		}
 		removed = append(removed, queue...)
 		delete(s.secretCmdQueue, deviceSN)
 	}

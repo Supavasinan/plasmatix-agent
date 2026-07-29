@@ -398,9 +398,12 @@ func validBiometricResultOutboxRecord(record biometricResultOutboxRecord) bool {
 		}
 		switch record.Status {
 		case "applied":
-			return record.ErrorCode == ""
+			return record.ReturnCode == 0 && record.ErrorCode == ""
 		case "failed":
-			return validBiometricErrorCode(record.ErrorCode)
+			validError := record.ErrorCode == "" ||
+				validBiometricErrorCode(record.ErrorCode)
+			return validError &&
+				(record.ReturnCode != 0 || record.ErrorCode != "")
 		default:
 			return false
 		}

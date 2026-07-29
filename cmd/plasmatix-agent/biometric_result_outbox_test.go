@@ -204,7 +204,7 @@ func TestBiometricResultOutboxAndActiveReservationsShareCapacityAtomically(
 		switch {
 		case result.reserved && result.code == "":
 			reserved++
-		case !result.reserved && result.code == "secret_command_queue_full":
+		case !result.reserved && result.code == "network_unavailable":
 			refused++
 		default:
 			t.Fatalf("unexpected admission result %#v", result)
@@ -315,7 +315,7 @@ func TestBiometricResultCombinedCapacityRecoversAndSurvivesRestart(
 	}
 	nextCommandID := testUUIDForIndex(900)
 	if reserved, code := server.reserveSecretCommand(nextCommandID); reserved ||
-		code != "secret_command_queue_full" {
+		code != "network_unavailable" {
 		t.Fatalf("full restarted admission reserved=%v code=%q", reserved, code)
 	}
 	first := reopened.snapshot()[0]

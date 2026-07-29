@@ -1243,7 +1243,11 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, "OK")
 			return
 		}
-		written, writeErr := s.writePendingSecretADMSCommand(w, command)
+		written, writeErr := s.writePendingSecretADMSCommandContext(
+			r.Context(),
+			w,
+			command,
+		)
 		if !written && writeErr == nil {
 			fmt.Fprint(w, "OK")
 		}

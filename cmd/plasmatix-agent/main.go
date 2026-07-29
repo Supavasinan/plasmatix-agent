@@ -1236,7 +1236,8 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if command := s.popSecretCommand(sn); command != nil {
+	command, secretWriterBusy := s.claimSecretCommandWriter(sn)
+	if command != nil {
 		if code := s.queuedSecretCommandCompatibility(command); code != "" {
 			s.failServedSecretCommand(command, code, -1)
 			fmt.Fprint(w, "OK")
@@ -1246,6 +1247,10 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 		if !written && writeErr == nil {
 			fmt.Fprint(w, "OK")
 		}
+		return
+	}
+	if secretWriterBusy {
+		fmt.Fprint(w, "OK")
 		return
 	}
 

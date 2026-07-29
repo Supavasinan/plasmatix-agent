@@ -89,6 +89,7 @@ type secretADMSCommand struct {
 	firstServedAt time.Time
 	serveAttempts int
 	deadlineStop  func() bool
+	writerActive  bool
 }
 
 func (command *secretADMSCommand) zeroPayload() {
@@ -972,10 +973,21 @@ func (s *ADMSServer) supersedeSecretDeployment(
 }
 
 func (s *ADMSServer) popSecretCommand(deviceSN string) *secretADMSCommand {
+	command, _ := s.claimSecretCommandWriter(deviceSN)
+	return command
+}
+
+func (s *ADMSServer) claimSecretCommandWriter(
+	deviceSN string,
+) (*secretADMSCommand, bool) {
 	s.mu.Lock()
 	for key, command := range s.secretPending {
 		if key.DeviceSN != deviceSN {
 			continue
+		}
+		if command.writerActive {
+			s.mu.Unlock()
+			return nil, true
 		}
 		if command.serveAttempts >= maxSecretCommandServeAttempts ||
 			(!command.firstServedAt.IsZero() &&
@@ -999,16 +1011,17 @@ func (s *ADMSServer) popSecretCommand(deviceSN string) *secretADMSCommand {
 			if wake {
 				s.wakeBiometricResultOutbox()
 			}
-			return nil
+			return nil, false
 		}
+		command.writerActive = true
 		command.serveAttempts++
 		s.mu.Unlock()
-		return command
+		return command, false
 	}
 	queue := s.secretCmdQueue[deviceSN]
 	if len(queue) == 0 {
 		s.mu.Unlock()
-		return nil
+		return nil, false
 	}
 	command := queue[0]
 	s.secretCmdQueue[deviceSN] = queue[1:]
@@ -1021,9 +1034,10 @@ func (s *ADMSServer) popSecretCommand(deviceSN string) *secretADMSCommand {
 	}] = command
 	command.firstServedAt = s.secretCommandNow()
 	command.serveAttempts = 1
+	command.writerActive = true
 	s.scheduleSecretCommandDeadlineLocked(command)
 	s.mu.Unlock()
-	return command
+	return command, false
 }
 
 func (s *ADMSServer) secretCommandNow() time.Time {
@@ -1107,27 +1121,29 @@ func (s *ADMSServer) writePendingSecretADMSCommand(
 	w http.ResponseWriter,
 	command *secretADMSCommand,
 ) (bool, error) {
+	key := pendingCommandKey{DeviceSN: command.deviceSN, LocalID: command.id}
+	command.payloadMu.Lock()
+	s.mu.Lock()
+	current, exists := s.secretPending[key]
+	if !exists || current != command || !command.writerActive {
+		s.mu.Unlock()
+		command.payloadMu.Unlock()
+		return false, nil
+	}
+	if len(command.payload) == 0 {
+		command.writerActive = false
+		s.mu.Unlock()
+		command.payloadMu.Unlock()
+		return false, nil
+	}
+	s.mu.Unlock()
+
 	writeTimeout := s.secretWriteTimeout
 	if writeTimeout <= 0 {
 		writeTimeout = secretCommandWriteTimeout
 	}
 	controller := http.NewResponseController(w)
 	_ = controller.SetWriteDeadline(time.Now().Add(writeTimeout))
-
-	key := pendingCommandKey{DeviceSN: command.deviceSN, LocalID: command.id}
-	s.mu.Lock()
-	current, exists := s.secretPending[key]
-	if !exists || current != command {
-		s.mu.Unlock()
-		return false, nil
-	}
-	command.payloadMu.Lock()
-	if len(command.payload) == 0 {
-		command.payloadMu.Unlock()
-		s.mu.Unlock()
-		return false, nil
-	}
-	s.mu.Unlock()
 	err := writeSecretADMSCommandLocked(w, command)
 	command.payloadMu.Unlock()
 	if err != nil {
@@ -1137,10 +1153,22 @@ func (s *ADMSServer) writePendingSecretADMSCommand(
 				"network_unavailable",
 				-1,
 			)
+		} else {
+			s.releaseSecretCommandWriter(command)
 		}
 		return false, err
 	}
+	s.releaseSecretCommandWriter(command)
 	return true, nil
+}
+
+func (s *ADMSServer) releaseSecretCommandWriter(command *secretADMSCommand) {
+	key := pendingCommandKey{DeviceSN: command.deviceSN, LocalID: command.id}
+	s.mu.Lock()
+	if current, exists := s.secretPending[key]; exists && current == command {
+		command.writerActive = false
+	}
+	s.mu.Unlock()
 }
 
 func secretCommandWriteTimedOut(err error) bool {

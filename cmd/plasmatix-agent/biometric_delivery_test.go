@@ -1432,6 +1432,371 @@ func (w *deadlineBlockingSecretResponseWriter) Write(value []byte) (int, error) 
 	return 0, secretResponseWriteTimeoutError{}
 }
 
+type deadlineRecordingSecretResponseWriter struct {
+	header   http.Header
+	deadline chan time.Time
+	body     bytes.Buffer
+}
+
+func (w *deadlineRecordingSecretResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *deadlineRecordingSecretResponseWriter) WriteHeader(_ int) {}
+
+func (w *deadlineRecordingSecretResponseWriter) SetWriteDeadline(
+	deadline time.Time,
+) error {
+	w.deadline <- deadline
+	return nil
+}
+
+func (w *deadlineRecordingSecretResponseWriter) Write(value []byte) (int, error) {
+	return w.body.Write(value)
+}
+
+func TestBiometricDeliverySecretWriteDeadlineStartsAfterPayloadPin(
+	t *testing.T,
+) {
+	command := &secretADMSCommand{
+		deviceSN:     "AC1",
+		deploymentID: testDeploymentID,
+		commandID:    testCommandID,
+		payload:      []byte("mutable-secret-command"),
+	}
+	server := &ADMSServer{
+		secretCmdQueue: map[string][]*secretADMSCommand{"AC1": {command}},
+		secretPending:  make(map[pendingCommandKey]*secretADMSCommand),
+		secretCmdID:    map[string]struct{}{testCommandID: {}},
+	}
+	command = server.popSecretCommand("AC1")
+	command.payloadMu.Lock()
+	writer := &deadlineRecordingSecretResponseWriter{
+		header:   make(http.Header),
+		deadline: make(chan time.Time, 1),
+	}
+	type writeResult struct {
+		written bool
+		err     error
+	}
+	done := make(chan writeResult, 1)
+	go func() {
+		written, err := server.writePendingSecretADMSCommand(writer, command)
+		done <- writeResult{written: written, err: err}
+	}()
+
+	select {
+	case deadline := <-writer.deadline:
+		command.payloadMu.Unlock()
+		<-done
+		t.Fatalf(
+			"write deadline %s started while the owning writer was waiting for the payload pin",
+			deadline,
+		)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if command.serveAttempts != 1 {
+		command.payloadMu.Unlock()
+		<-done
+		t.Fatalf("serve attempts while waiting for payload pin = %d; want 1", command.serveAttempts)
+	}
+
+	command.payloadMu.Unlock()
+	select {
+	case <-writer.deadline:
+	case <-time.After(time.Second):
+		t.Fatal("write deadline was not set immediately before the actual write")
+	}
+	result := <-done
+	if !result.written || result.err != nil {
+		t.Fatalf("write after payload pin written=%v err=%v", result.written, result.err)
+	}
+	server.shutdownBiometricDelivery()
+}
+
+func TestBiometricDeliveryConcurrentPollHasOneWriterAndResponsiveTerminalState(
+	t *testing.T,
+) {
+	tests := []struct {
+		name       string
+		startEvent func(*ADMSServer, *manualSecretClock, int) <-chan struct{}
+		stateReady func(*ADMSServer, pendingCommandKey) bool
+	}{
+		{
+			name: "ACK",
+			startEvent: func(
+				server *ADMSServer,
+				_ *manualSecretClock,
+				localID int,
+			) <-chan struct{} {
+				done := make(chan struct{})
+				go func() {
+					server.completeSecretCommand(
+						pendingCommandKey{DeviceSN: "AC1", LocalID: localID},
+						0,
+					)
+					close(done)
+				}()
+				return done
+			},
+			stateReady: func(server *ADMSServer, key pendingCommandKey) bool {
+				_, pending := server.secretPending[key]
+				return !pending
+			},
+		},
+		{
+			name: "expiry",
+			startEvent: func(
+				_ *ADMSServer,
+				clock *manualSecretClock,
+				_ int,
+			) <-chan struct{} {
+				done := make(chan struct{})
+				go func() {
+					clock.Advance(secretCommandServeDeadline)
+					close(done)
+				}()
+				return done
+			},
+			stateReady: func(server *ADMSServer, key pendingCommandKey) bool {
+				_, pending := server.secretPending[key]
+				return !pending
+			},
+		},
+		{
+			name: "shutdown",
+			startEvent: func(
+				server *ADMSServer,
+				_ *manualSecretClock,
+				_ int,
+			) <-chan struct{} {
+				done := make(chan struct{})
+				go func() {
+					server.shutdownBiometricDelivery()
+					close(done)
+				}()
+				return done
+			},
+			stateReady: func(server *ADMSServer, _ pendingCommandKey) bool {
+				return server.secretClosed && len(server.secretPending) == 0
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outbox, err := openBiometricResultOutbox(t.TempDir())
+			if err != nil {
+				t.Fatalf("open outbox: %v", err)
+			}
+			clock := newManualSecretClock()
+			original := []byte("mutable-secret-command")
+			command := &secretADMSCommand{
+				deviceSN:     "AC1",
+				deploymentID: testDeploymentID,
+				commandID:    testCommandID,
+				sha256:       strings.Repeat("a", 64),
+				payload:      append([]byte(nil), original...),
+			}
+			server := &ADMSServer{
+				secretCmdQueue:      map[string][]*secretADMSCommand{"AC1": {command}},
+				secretPending:       make(map[pendingCommandKey]*secretADMSCommand),
+				secretCmdID:         map[string]struct{}{testCommandID: {}},
+				resultOutbox:        outbox,
+				resultOutboxStarted: true,
+			}
+			useManualSecretClock(server, clock)
+
+			first := server.popSecretCommand("AC1")
+			firstWriter := &blockingSecretResponseWriter{
+				header:  make(http.Header),
+				started: make(chan struct{}),
+				release: make(chan struct{}),
+			}
+			firstDone := make(chan error, 1)
+			go func() {
+				_, writeErr := server.writePendingSecretADMSCommand(firstWriter, first)
+				firstDone <- writeErr
+			}()
+			<-firstWriter.started
+
+			type claimResult struct {
+				command *secretADMSCommand
+				busy    bool
+			}
+			secondSelected := make(chan claimResult, 1)
+			secondDone := make(chan error, 1)
+			go func() {
+				second, busy := server.claimSecretCommandWriter("AC1")
+				secondSelected <- claimResult{command: second, busy: busy}
+				if second == nil {
+					secondDone <- nil
+					return
+				}
+				_, writeErr := server.writePendingSecretADMSCommand(
+					httptest.NewRecorder(),
+					second,
+				)
+				secondDone <- writeErr
+			}()
+			second := <-secondSelected
+			if second.command != nil {
+				t.Errorf(
+					"concurrent poll selected pending command %d while its writer was active",
+					second.command.id,
+				)
+			}
+			if !second.busy {
+				t.Error("concurrent poll did not receive the immediate retry signal")
+			}
+			if first.serveAttempts != 1 {
+				t.Errorf("concurrent poll incremented serve attempts to %d; want 1", first.serveAttempts)
+			}
+
+			reservationDone := make(chan bool, 1)
+			go func() {
+				ok, _ := server.reserveSecretCommand(testStaleID)
+				reservationDone <- ok
+			}()
+			select {
+			case reserved := <-reservationDone:
+				if !reserved {
+					t.Error("unrelated reservation was refused while a writer was active")
+				}
+			case <-time.After(100 * time.Millisecond):
+				close(firstWriter.release)
+				<-firstDone
+				<-secondDone
+				t.Fatal("duplicate writer blocked an unrelated reservation")
+			}
+
+			key := pendingCommandKey{DeviceSN: "AC1", LocalID: first.id}
+			eventDone := tt.startEvent(server, clock, first.id)
+			stateDeadline := time.Now().Add(100 * time.Millisecond)
+			stateResponsive := false
+			for time.Now().Before(stateDeadline) {
+				if server.mu.TryLock() {
+					stateResponsive = tt.stateReady(server, key)
+					server.mu.Unlock()
+					if stateResponsive {
+						break
+					}
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if !stateResponsive {
+				close(firstWriter.release)
+				<-firstDone
+				<-secondDone
+				<-eventDone
+				t.Fatalf("%s could not detach terminal state while the first writer was stalled", tt.name)
+			}
+			select {
+			case <-eventDone:
+				close(firstWriter.release)
+				<-firstDone
+				<-secondDone
+				t.Fatalf("%s zeroed or completed before the active writer released its payload pin", tt.name)
+			case <-time.After(25 * time.Millisecond):
+			}
+
+			close(firstWriter.release)
+			if writeErr := <-firstDone; writeErr != nil {
+				t.Fatalf("first writer release: %v", writeErr)
+			}
+			if writeErr := <-secondDone; writeErr != nil {
+				t.Fatalf("second poll: %v", writeErr)
+			}
+			select {
+			case <-eventDone:
+			case <-time.After(time.Second):
+				t.Fatalf("%s did not complete after the active writer released its payload pin", tt.name)
+			}
+			if !bytes.Equal(firstWriter.body, original) {
+				t.Fatalf("first writer body = %q; want %q", firstWriter.body, original)
+			}
+			for index, value := range command.payload {
+				if value != 0 {
+					t.Fatalf("%s retained payload byte %d", tt.name, index)
+				}
+			}
+			if tt.name != "shutdown" {
+				server.shutdownBiometricDelivery()
+			}
+		})
+	}
+}
+
+func TestBiometricDeliveryConcurrentPollAtAttemptLimitDoesNotWaitForWriter(
+	t *testing.T,
+) {
+	command := &secretADMSCommand{
+		deviceSN:     "AC1",
+		deploymentID: testDeploymentID,
+		commandID:    testCommandID,
+		payload:      []byte("mutable-secret-command"),
+	}
+	server := &ADMSServer{
+		secretCmdQueue: map[string][]*secretADMSCommand{"AC1": {command}},
+		secretPending:  make(map[pendingCommandKey]*secretADMSCommand),
+		secretCmdID:    map[string]struct{}{testCommandID: {}},
+	}
+	first := server.popSecretCommand("AC1")
+	server.mu.Lock()
+	first.serveAttempts = maxSecretCommandServeAttempts
+	server.mu.Unlock()
+	writer := &blockingSecretResponseWriter{
+		header:  make(http.Header),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	writeDone := make(chan error, 1)
+	go func() {
+		_, writeErr := server.writePendingSecretADMSCommand(writer, first)
+		writeDone <- writeErr
+	}()
+	<-writer.started
+
+	type claimResult struct {
+		command *secretADMSCommand
+		busy    bool
+	}
+	secondDone := make(chan claimResult, 1)
+	go func() {
+		second, busy := server.claimSecretCommandWriter("AC1")
+		secondDone <- claimResult{command: second, busy: busy}
+	}()
+	select {
+	case second := <-secondDone:
+		if second.command != nil {
+			t.Errorf("attempt-limit poll selected active command %d", second.command.id)
+		}
+		if !second.busy {
+			t.Error("attempt-limit poll did not receive the immediate retry signal")
+		}
+	case <-time.After(100 * time.Millisecond):
+		close(writer.release)
+		<-writeDone
+		<-secondDone
+		t.Fatal("attempt-limit poll waited for the active writer payload pin")
+	}
+	if first.serveAttempts != maxSecretCommandServeAttempts {
+		close(writer.release)
+		<-writeDone
+		t.Fatalf(
+			"attempt-limit poll changed serve attempts to %d; want %d",
+			first.serveAttempts,
+			maxSecretCommandServeAttempts,
+		)
+	}
+
+	close(writer.release)
+	if writeErr := <-writeDone; writeErr != nil {
+		t.Fatalf("release active writer: %v", writeErr)
+	}
+	server.shutdownBiometricDelivery()
+}
+
 func TestBiometricDeliverySecretWriteDeadlineDurablyTerminatesAndReleases(
 	t *testing.T,
 ) {

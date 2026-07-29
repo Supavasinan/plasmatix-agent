@@ -31,7 +31,10 @@ var (
 
 type biometricResultOutboxRecord struct {
 	DeploymentID  string    `json:"deploymentId"`
+	Operation     string    `json:"operation,omitempty"`
 	CommandID     string    `json:"commandId"`
+	Attempt       int       `json:"attempt,omitempty"`
+	VaultAssetID  string    `json:"vaultAssetId,omitempty"`
 	DeviceSN      string    `json:"deviceSn"`
 	Status        string    `json:"status"`
 	SHA256        string    `json:"sha256,omitempty"`
@@ -192,7 +195,10 @@ func (outbox *biometricResultOutbox) enqueueWithCommit(
 ) error {
 	record := biometricResultOutboxRecord{
 		DeploymentID:  deploymentID,
+		Operation:     result.Operation,
 		CommandID:     result.CommandID,
+		Attempt:       result.Attempt,
+		VaultAssetID:  result.VaultAssetID,
 		DeviceSN:      result.DeviceSN,
 		Status:        result.Status,
 		SHA256:        result.SHA256,
@@ -376,9 +382,32 @@ func validBiometricResultOutboxRecord(record biometricResultOutboxRecord) bool {
 	if !validBiometricUUID(record.DeploymentID) ||
 		!validBiometricUUID(record.CommandID) ||
 		!validDeliveryIdentifier(record.DeviceSN) ||
+		record.ReturnCode < -2_147_483_648 ||
+		record.ReturnCode > 2_147_483_647 ||
 		record.Attempts < 0 ||
 		record.Attempts > 1_000_000 ||
 		record.NextAttemptAt.IsZero() {
+		return false
+	}
+	if record.Operation == "delete" {
+		if record.Attempt < 1 ||
+			record.Attempt > 5 ||
+			!validBiometricUUID(record.VaultAssetID) ||
+			record.SHA256 != "" {
+			return false
+		}
+		switch record.Status {
+		case "applied":
+			return record.ErrorCode == ""
+		case "failed":
+			return validBiometricErrorCode(record.ErrorCode)
+		default:
+			return false
+		}
+	}
+	if record.Operation != "" ||
+		record.Attempt != 0 ||
+		record.VaultAssetID != "" {
 		return false
 	}
 	switch record.Status {
@@ -397,7 +426,10 @@ func sameBiometricResultOutboxValue(
 	right biometricResultOutboxRecord,
 ) bool {
 	return left.DeploymentID == right.DeploymentID &&
+		left.Operation == right.Operation &&
 		left.CommandID == right.CommandID &&
+		left.Attempt == right.Attempt &&
+		left.VaultAssetID == right.VaultAssetID &&
 		left.DeviceSN == right.DeviceSN &&
 		left.Status == right.Status &&
 		left.SHA256 == right.SHA256 &&
@@ -539,12 +571,15 @@ func (s *ADMSServer) postBiometricDeploymentResult(
 	record biometricResultOutboxRecord,
 ) (terminal bool, err error) {
 	result := biometricDeploymentResult{
-		Status:     record.Status,
-		DeviceSN:   record.DeviceSN,
-		SHA256:     record.SHA256,
-		ErrorCode:  record.ErrorCode,
-		CommandID:  record.CommandID,
-		ReturnCode: record.ReturnCode,
+		Operation:    record.Operation,
+		Status:       record.Status,
+		DeviceSN:     record.DeviceSN,
+		SHA256:       record.SHA256,
+		ErrorCode:    record.ErrorCode,
+		CommandID:    record.CommandID,
+		Attempt:      record.Attempt,
+		VaultAssetID: record.VaultAssetID,
+		ReturnCode:   record.ReturnCode,
 	}
 	body, marshalErr := json.Marshal(result)
 	if marshalErr != nil {

@@ -1264,8 +1264,9 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	cmd := queue[0]
 	s.cmdQueue[sn] = queue[1:]
-	if _, reference := parseBiometricDeploymentReference(cmd.Command); reference &&
-		cmd.CloudID != "" {
+	_, deploymentReference := parseBiometricDeploymentReference(cmd.Command)
+	_, deletionReference := parseBiometricDeletionReference(cmd.Command)
+	if (deploymentReference || deletionReference) && cmd.CloudID != "" {
 		delete(s.cloudCmdID, cmd.CloudID)
 	}
 	s.mu.Unlock()

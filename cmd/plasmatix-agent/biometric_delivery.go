@@ -77,19 +77,30 @@ type biometricDeploymentMetadata struct {
 	SHA256          string
 }
 
+type biometricDeletionMetadata struct {
+	PersonnelID string
+	Kind        string
+	BioType     int
+	SlotIndex   int
+}
+
 type secretADMSCommand struct {
-	id            int
-	deviceSN      string
-	deploymentID  string
-	commandID     string
-	sha256        string
-	metadata      biometricDeploymentMetadata
-	payloadMu     sync.Mutex
-	payload       []byte
-	firstServedAt time.Time
-	serveAttempts int
-	deadlineStop  func() bool
-	writerActive  bool
+	id             int
+	deviceSN       string
+	deploymentID   string
+	commandID      string
+	operation      string
+	attempt        int
+	vaultAssetID   string
+	sha256         string
+	metadata       biometricDeploymentMetadata
+	deleteMetadata biometricDeletionMetadata
+	payloadMu      sync.Mutex
+	payload        []byte
+	firstServedAt  time.Time
+	serveAttempts  int
+	deadlineStop   func() bool
+	writerActive   bool
 }
 
 func (command *secretADMSCommand) zeroPayload() {
@@ -99,13 +110,34 @@ func (command *secretADMSCommand) zeroPayload() {
 	command.payloadMu.Unlock()
 }
 
+func (command *secretADMSCommand) result(
+	status,
+	errorCode string,
+	returnCode int,
+) biometricDeploymentResult {
+	return biometricDeploymentResult{
+		Operation:    command.operation,
+		Status:       status,
+		DeviceSN:     command.deviceSN,
+		SHA256:       command.sha256,
+		ErrorCode:    errorCode,
+		CommandID:    command.commandID,
+		Attempt:      command.attempt,
+		VaultAssetID: command.vaultAssetID,
+		ReturnCode:   returnCode,
+	}
+}
+
 type biometricDeploymentResult struct {
-	Status     string `json:"status"`
-	DeviceSN   string `json:"deviceSn"`
-	SHA256     string `json:"sha256"`
-	ErrorCode  string `json:"errorCode,omitempty"`
-	CommandID  string `json:"commandId"`
-	ReturnCode int    `json:"returnCode"`
+	Operation    string `json:"operation,omitempty"`
+	Status       string `json:"status"`
+	DeviceSN     string `json:"deviceSn"`
+	SHA256       string `json:"sha256,omitempty"`
+	ErrorCode    string `json:"errorCode,omitempty"`
+	CommandID    string `json:"commandId"`
+	Attempt      int    `json:"attempt,omitempty"`
+	VaultAssetID string `json:"vaultAssetId,omitempty"`
+	ReturnCode   int    `json:"returnCode"`
 }
 
 type pendingBiometricResult struct {
@@ -173,18 +205,36 @@ func parseBiometricDeploymentReference(command string) (string, bool) {
 	return fields[1], true
 }
 
+func parseBiometricDeletionReference(command string) (string, bool) {
+	fields := strings.Fields(command)
+	if len(fields) == 0 || fields[0] != "DELETE_BIOMETRIC_ASSET" {
+		return "", false
+	}
+	const prefix = "DELETE_BIOMETRIC_ASSET "
+	if len(fields) != 2 ||
+		command != prefix+fields[1] ||
+		!validBiometricUUID(fields[1]) {
+		return "", true
+	}
+	return fields[1], true
+}
+
 func (s *ADMSServer) interceptBiometricDeploymentReference(
 	deviceSN string,
 	command ADMSCommand,
 ) bool {
-	deploymentID, reference := parseBiometricDeploymentReference(command.Command)
-	if !reference {
-		return false
+	deploymentID, deleteReference := parseBiometricDeletionReference(command.Command)
+	if !deleteReference {
+		var reference bool
+		deploymentID, reference = parseBiometricDeploymentReference(command.Command)
+		if !reference {
+			return false
+		}
 	}
 	if !validBiometricUUID(command.CloudID) ||
 		!validBiometricUUID(deploymentID) ||
 		!validDeliveryIdentifier(deviceSN) {
-		if command.CloudID != "" {
+		if !deleteReference && command.CloudID != "" {
 			go s.reportCloudCommandResult(
 				command.CloudID,
 				-2,
@@ -204,13 +254,156 @@ func (s *ADMSServer) interceptBiometricDeploymentReference(
 	}
 	go func() {
 		defer s.biometricDeliveryWorkers.Done()
+		processContext := withReservedBiometricDeploymentCommandID(
+			ctx,
+			command.CloudID,
+		)
+		if deleteReference {
+			_ = s.agent.ProcessBiometricDeletion(
+				processContext,
+				deploymentID,
+				deviceSN,
+			)
+			return
+		}
 		_ = s.agent.ProcessBiometricDeployment(
-			withReservedBiometricDeploymentCommandID(ctx, command.CloudID),
+			processContext,
 			deploymentID,
 			deviceSN,
 		)
 	}()
 	return true
+}
+
+func (a *Agent) ProcessBiometricDeletion(
+	ctx context.Context,
+	deploymentID,
+	deviceSN string,
+) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	commandID, preReserved := biometricDeploymentCommand(ctx)
+	if !validBiometricUUID(deploymentID) ||
+		!validBiometricUUID(commandID) ||
+		!validDeliveryIdentifier(deviceSN) {
+		return deliveryError("stale_deployment_command")
+	}
+	if a.adms == nil || a.devices == nil {
+		return deliveryError("deployment_delivery_unavailable")
+	}
+	processContext, finishProcess, admitted := a.adms.startBiometricDeliveryProcess(ctx)
+	if !admitted {
+		if preReserved {
+			a.adms.releaseSecretCommand(commandID)
+		}
+		return deliveryError("deployment_cancelled")
+	}
+	defer finishProcess()
+	ctx = processContext
+
+	reserved, reservationCode := true, ""
+	if !preReserved {
+		reserved, reservationCode = a.adms.reserveSecretCommand(commandID)
+	}
+	if !reserved && reservationCode == "" {
+		return nil
+	}
+	if !reserved {
+		return deliveryError(reservationCode)
+	}
+	retainReservation := false
+	defer func() {
+		if !retainReservation {
+			a.adms.releaseSecretCommand(commandID)
+		}
+	}()
+
+	claimed, err := a.claimBiometricDeletion(
+		ctx,
+		deploymentID,
+		deviceSN,
+		commandID,
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+	if claimed == nil {
+		return nil
+	}
+	a.adms.supersedeSecretDeployment(deploymentID, commandID)
+
+	metadata := biometricDeletionMetadata{
+		PersonnelID: claimed.PersonnelID,
+		Kind:        claimed.Asset.Kind,
+		BioType:     claimed.Asset.BioType,
+		SlotIndex:   claimed.Asset.SlotIndex,
+	}
+	state, found := a.devices.protocolState(deviceSN)
+	if !found {
+		err = deliveryError("target_profile_untrusted")
+		retainReservation = true
+		a.reportBiometricDeletionFailure(ctx, claimed, deliveryErrorCode(err))
+		return err
+	}
+	rendered, renderCode := renderBiometricDeletionCommand(state, metadata)
+	if renderCode != "" {
+		zeroBytes(rendered)
+		err = deliveryError(renderCode)
+		retainReservation = true
+		a.reportBiometricDeletionFailure(ctx, claimed, renderCode)
+		return err
+	}
+	renderedOwnedByQueue := false
+	defer func() {
+		if !renderedOwnedByQueue {
+			zeroBytes(rendered)
+		}
+	}()
+	if ctx.Err() != nil {
+		return deliveryError("deployment_cancelled")
+	}
+
+	rechecked, err := a.claimBiometricDeletion(
+		ctx,
+		deploymentID,
+		deviceSN,
+		commandID,
+		&biometricDeletionRecheck{
+			Attempt:      claimed.Attempt,
+			VaultAssetID: claimed.VaultAssetID,
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if !sameClaimedBiometricDeletion(claimed, rechecked) {
+		return deliveryError("stale_deployment_attempt")
+	}
+	if ctx.Err() != nil {
+		return deliveryError("deployment_cancelled")
+	}
+
+	queued := a.adms.enqueueSecretCommand(&secretADMSCommand{
+		deviceSN:       deviceSN,
+		deploymentID:   deploymentID,
+		commandID:      commandID,
+		operation:      "delete",
+		attempt:        claimed.Attempt,
+		vaultAssetID:   claimed.VaultAssetID,
+		deleteMetadata: metadata,
+		payload:        rendered,
+	})
+	if !queued {
+		err = deliveryError("secret_command_queue_full")
+		retainReservation = true
+		a.reportBiometricDeletionFailure(ctx, claimed, deliveryErrorCode(err))
+		return err
+	}
+	renderedOwnedByQueue = true
+	retainReservation = true
+	return nil
 }
 
 func (a *Agent) ProcessBiometricDeployment(
@@ -449,6 +642,170 @@ func (a *Agent) claimBiometricDeployment(
 	return &claimed, nil
 }
 
+type biometricDeletionRecheck struct {
+	Attempt      int    `json:"attempt"`
+	VaultAssetID string `json:"vaultAssetId"`
+}
+
+type claimedBiometricDeletion struct {
+	Operation    string `json:"operation"`
+	DeploymentID string `json:"deploymentId"`
+	CommandID    string `json:"commandId"`
+	Attempt      int    `json:"attempt"`
+	DeviceSN     string `json:"deviceSn"`
+	PersonnelID  string `json:"personnelId"`
+	VaultAssetID string `json:"vaultAssetId"`
+	Asset        struct {
+		Kind      string `json:"kind"`
+		BioType   int    `json:"bioType"`
+		SlotIndex int    `json:"slotIndex"`
+	} `json:"asset"`
+}
+
+func (a *Agent) claimBiometricDeletion(
+	ctx context.Context,
+	deploymentID,
+	deviceSN,
+	expectedCommandID string,
+	recheck *biometricDeletionRecheck,
+) (*claimedBiometricDeletion, error) {
+	requestInput := struct {
+		DeploymentID      string                    `json:"deploymentId"`
+		DeviceSN          string                    `json:"deviceSn"`
+		ExpectedCommandID string                    `json:"expectedCommandId"`
+		Recheck           *biometricDeletionRecheck `json:"recheck,omitempty"`
+	}{
+		DeploymentID:      deploymentID,
+		DeviceSN:          deviceSN,
+		ExpectedCommandID: expectedCommandID,
+		Recheck:           recheck,
+	}
+	requestBody, err := json.Marshal(requestInput)
+	if err != nil {
+		return nil, deliveryError("deployment_claim_failed")
+	}
+	defer zeroBytes(requestBody)
+
+	endpoint := strings.TrimRight(a.config.PlamatixURL, "/") +
+		"/api/agent-bridge/biometric-vault/deployments"
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		endpoint,
+		bytes.NewReader(requestBody),
+	)
+	if err != nil {
+		return nil, classifyBiometricRequestError(ctx, "deployment_claim_failed")
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-API-Key", a.config.APIKey)
+	response, err := cloudHTTPClient(biometricDeliveryHTTPTimeout).Do(request)
+	if err != nil {
+		return nil, classifyBiometricRequestError(ctx, "network_unavailable")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, biometricHTTPError(response, "deployment_claim_failed")
+	}
+	if !exactBiometricHeader(response.Header, "Cache-Control", "no-store") {
+		return nil, deliveryError("invalid_deployment_claim")
+	}
+	body, err := io.ReadAll(io.LimitReader(
+		response.Body,
+		maxBiometricClaimBodyBytes+1,
+	))
+	if err != nil || len(body) > maxBiometricClaimBodyBytes {
+		zeroBytes(body)
+		return nil, deliveryError("invalid_deployment_claim")
+	}
+	defer zeroBytes(body)
+	if !jsonHasUniqueObjectMembers(body) {
+		return nil, deliveryError("invalid_deployment_claim")
+	}
+
+	var envelope struct {
+		Deployments []json.RawMessage `json:"deployments"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&envelope) != nil {
+		return nil, deliveryError("invalid_deployment_claim")
+	}
+	var trailing any
+	if decoder.Decode(&trailing) != io.EOF {
+		return nil, deliveryError("invalid_deployment_claim")
+	}
+	if len(envelope.Deployments) == 0 {
+		return nil, nil
+	}
+	if len(envelope.Deployments) != 1 {
+		return nil, deliveryError("invalid_deployment_claim")
+	}
+	var claimed claimedBiometricDeletion
+	decoder = json.NewDecoder(bytes.NewReader(envelope.Deployments[0]))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&claimed) != nil || decoder.Decode(&trailing) != io.EOF {
+		return nil, deliveryError("invalid_deployment_claim")
+	}
+	if claimed.CommandID != expectedCommandID {
+		return nil, deliveryError("stale_deployment_command")
+	}
+	if !validClaimedBiometricDeletion(claimed, deploymentID, deviceSN) {
+		return nil, deliveryError("invalid_deployment_claim")
+	}
+	if recheck != nil &&
+		(claimed.Attempt != recheck.Attempt ||
+			claimed.VaultAssetID != recheck.VaultAssetID) {
+		return nil, deliveryError("stale_deployment_attempt")
+	}
+	return &claimed, nil
+}
+
+func validClaimedBiometricDeletion(
+	claimed claimedBiometricDeletion,
+	deploymentID,
+	deviceSN string,
+) bool {
+	if claimed.Operation != "delete" ||
+		claimed.DeploymentID != deploymentID ||
+		claimed.DeviceSN != deviceSN ||
+		!validBiometricUUID(claimed.CommandID) ||
+		!validBiometricUUID(claimed.VaultAssetID) ||
+		claimed.Attempt < 1 ||
+		claimed.Attempt > 5 ||
+		!validDeliveryIdentifier(claimed.PersonnelID) ||
+		claimed.Asset.SlotIndex < 0 ||
+		claimed.Asset.SlotIndex > 9 {
+		return false
+	}
+	switch claimed.Asset.Kind {
+	case "fingerprint_template":
+		return claimed.Asset.BioType == 1
+	case "face_template", "face_comparison_photo":
+		return claimed.Asset.BioType == 9
+	default:
+		return false
+	}
+}
+
+func sameClaimedBiometricDeletion(
+	left,
+	right *claimedBiometricDeletion,
+) bool {
+	return left != nil &&
+		right != nil &&
+		left.Operation == right.Operation &&
+		left.DeploymentID == right.DeploymentID &&
+		left.CommandID == right.CommandID &&
+		left.Attempt == right.Attempt &&
+		left.DeviceSN == right.DeviceSN &&
+		left.PersonnelID == right.PersonnelID &&
+		left.VaultAssetID == right.VaultAssetID &&
+		left.Asset.Kind == right.Asset.Kind &&
+		left.Asset.BioType == right.Asset.BioType &&
+		left.Asset.SlotIndex == right.Asset.SlotIndex
+}
+
 func validClaimedBiometricDeployment(
 	claimed claimedBiometricDeployment,
 	deploymentID,
@@ -590,6 +947,132 @@ func biometricDeploymentSizeLimit(kind string) int {
 	default:
 		return 0
 	}
+}
+
+func renderBiometricDeletionCommand(
+	state DeviceProtocolState,
+	metadata biometricDeletionMetadata,
+) ([]byte, string) {
+	renderer, code := validateLiveBiometricDeletion(state, metadata)
+	if code != "" {
+		return nil, code
+	}
+	command := make([]byte, 0, 128)
+	switch renderer {
+	case "finger_fp":
+		command = append(command, "DATA DELETE FP PIN="...)
+		command = append(command, metadata.PersonnelID...)
+		command = append(command, "\tFID="...)
+		command = strconv.AppendInt(command, int64(metadata.SlotIndex), 10)
+	case "finger_legacy":
+		command = append(command, "DATA DELETE FINGERTMP PIN="...)
+		command = append(command, metadata.PersonnelID...)
+		command = append(command, "\tFID="...)
+		command = strconv.AppendInt(command, int64(metadata.SlotIndex), 10)
+	case "biodata":
+		command = append(command, "DATA DELETE BIODATA Pin="...)
+		command = append(command, metadata.PersonnelID...)
+		command = append(command, "\tNo="...)
+		command = strconv.AppendInt(command, int64(metadata.SlotIndex), 10)
+		command = append(command, "\tType="...)
+		command = strconv.AppendInt(command, int64(metadata.BioType), 10)
+	case "biophoto":
+		command = append(command, "DATA DELETE BIOPHOTO PIN="...)
+		command = append(command, metadata.PersonnelID...)
+		command = append(command, "\tNo="...)
+		command = strconv.AppendInt(command, int64(metadata.SlotIndex), 10)
+		command = append(command, "\tType=9"...)
+	default:
+		return nil, "record_type_unsupported"
+	}
+	return command, ""
+}
+
+func validateLiveBiometricDeletion(
+	state DeviceProtocolState,
+	metadata biometricDeletionMetadata,
+) (string, string) {
+	if state.Confidence < 80 || state.Confidence > 100 {
+		return "", "target_profile_untrusted"
+	}
+	if !validDeliveryIdentifier(metadata.PersonnelID) ||
+		metadata.SlotIndex < 0 ||
+		metadata.SlotIndex > 9 {
+		return "", "invalid_deployment_claim"
+	}
+	switch metadata.Kind {
+	case "fingerprint_template":
+		if metadata.BioType != 1 {
+			return "", "invalid_deployment_claim"
+		}
+	case "face_template", "face_comparison_photo":
+		if metadata.BioType != 9 {
+			return "", "invalid_deployment_claim"
+		}
+	default:
+		return "", "invalid_deployment_claim"
+	}
+
+	capabilities := normalizeCapabilities(state.Capabilities)
+	switch state.Profile {
+	case ProtocolTAPush:
+		taVersion, valid := approvedTAPushVersion(state.PushVersion)
+		if !valid {
+			return "", "target_profile_untrusted"
+		}
+		if metadata.Kind != "fingerprint_template" ||
+			capabilities["fingerfunon"] != "1" {
+			return "", "record_type_unsupported"
+		}
+		major, _, valid := algorithmVersion(
+			capabilities["fingeralgorithmversion"],
+		)
+		if !valid {
+			return "", "algorithm_unknown"
+		}
+		if major <= 10 {
+			if comparePushVersion(taVersion, [3]int{2, 2, 14}) < 0 {
+				return "finger_fp", ""
+			}
+			return "finger_legacy", ""
+		}
+		if capabilities["biodatafun"] != "1" {
+			return "", "record_type_unsupported"
+		}
+		return "biodata", ""
+	case ProtocolACPush3:
+		switch metadata.Kind {
+		case "fingerprint_template":
+			if capabilities["fingerfunon"] != "1" ||
+				capabilities["biodatafun"] != "1" {
+				return "", "record_type_unsupported"
+			}
+			if _, _, valid := algorithmVersion(
+				capabilities["fingeralgorithmversion"],
+			); !valid {
+				return "", "algorithm_unknown"
+			}
+			return "biodata", ""
+		case "face_template":
+			if capabilities["facefunon"] != "1" ||
+				capabilities["biodatafun"] != "1" {
+				return "", "record_type_unsupported"
+			}
+			if _, _, valid := algorithmVersion(
+				capabilities["facealgorithmversion"],
+			); !valid {
+				return "", "algorithm_unknown"
+			}
+			return "biodata", ""
+		case "face_comparison_photo":
+			if capabilities["facefunon"] != "1" ||
+				capabilities["biophotofun"] != "1" {
+				return "", "record_type_unsupported"
+			}
+			return "biophoto", ""
+		}
+	}
+	return "", "target_profile_untrusted"
 }
 
 func renderBiometricDeploymentCommand(
@@ -998,14 +1481,11 @@ func (s *ADMSServer) claimSecretCommandWriter(
 			s.mu.Unlock()
 			command.zeroPayload()
 			s.mu.Lock()
-			wake := s.enqueueBiometricResultLocked(biometricDeploymentResult{
-				Status:     "failed",
-				DeviceSN:   command.deviceSN,
-				SHA256:     command.sha256,
-				ErrorCode:  "network_unavailable",
-				CommandID:  command.commandID,
-				ReturnCode: -1,
-			}, command.deploymentID)
+			wake := s.enqueueBiometricResultLocked(command.result(
+				"failed",
+				"network_unavailable",
+				-1,
+			), command.deploymentID)
 			s.mu.Unlock()
 			if wake {
 				s.wakeBiometricResultOutbox()
@@ -1083,14 +1563,11 @@ func (s *ADMSServer) expirePendingSecretCommand(command *secretADMSCommand) {
 	s.mu.Unlock()
 	command.zeroPayload()
 	s.mu.Lock()
-	wake := s.enqueueBiometricResultLocked(biometricDeploymentResult{
-		Status:     "failed",
-		DeviceSN:   command.deviceSN,
-		SHA256:     command.sha256,
-		ErrorCode:  "network_unavailable",
-		CommandID:  command.commandID,
-		ReturnCode: -1,
-	}, command.deploymentID)
+	wake := s.enqueueBiometricResultLocked(command.result(
+		"failed",
+		"network_unavailable",
+		-1,
+	), command.deploymentID)
 	s.mu.Unlock()
 	if wake {
 		s.wakeBiometricResultOutbox()
@@ -1106,6 +1583,10 @@ func (s *ADMSServer) queuedSecretCommandCompatibility(
 	state, found := s.agent.devices.protocolState(command.deviceSN)
 	if !found {
 		return "target_profile_untrusted"
+	}
+	if command.operation == "delete" {
+		_, code := validateLiveBiometricDeletion(state, command.deleteMetadata)
+		return code
 	}
 	return validateLiveBiometricRenderer(state, command.metadata)
 }
@@ -1228,14 +1709,11 @@ func (s *ADMSServer) failServedSecretCommand(
 	}
 	command.zeroPayload()
 	s.mu.Lock()
-	wake := s.enqueueBiometricResultLocked(biometricDeploymentResult{
-		Status:     "failed",
-		DeviceSN:   command.deviceSN,
-		SHA256:     command.sha256,
-		ErrorCode:  code,
-		CommandID:  command.commandID,
-		ReturnCode: returnCode,
-	}, command.deploymentID)
+	wake := s.enqueueBiometricResultLocked(command.result(
+		"failed",
+		code,
+		returnCode,
+	), command.deploymentID)
 	s.mu.Unlock()
 	if wake {
 		s.wakeBiometricResultOutbox()
@@ -1258,13 +1736,7 @@ func (s *ADMSServer) completeSecretCommand(
 	s.mu.Unlock()
 	command.zeroPayload()
 
-	result := biometricDeploymentResult{
-		Status:     "applied",
-		DeviceSN:   command.deviceSN,
-		SHA256:     command.sha256,
-		CommandID:  command.commandID,
-		ReturnCode: returnCode,
-	}
+	result := command.result("applied", "", returnCode)
 	if returnCode != 0 {
 		result.Status = "failed"
 		result.ErrorCode = "device_command_failed"
@@ -1316,6 +1788,26 @@ func (a *Agent) reportBiometricDeploymentFailure(
 		digest,
 		code,
 	)
+}
+
+func (a *Agent) reportBiometricDeletionFailure(
+	_ context.Context,
+	claimed *claimedBiometricDeletion,
+	code string,
+) {
+	if a.adms == nil || claimed == nil {
+		return
+	}
+	a.adms.startBiometricResultWorker(biometricDeploymentResult{
+		Operation:    "delete",
+		Status:       "failed",
+		DeviceSN:     claimed.DeviceSN,
+		ErrorCode:    code,
+		CommandID:    claimed.CommandID,
+		Attempt:      claimed.Attempt,
+		VaultAssetID: claimed.VaultAssetID,
+		ReturnCode:   -1,
+	}, claimed.DeploymentID)
 }
 
 func (s *ADMSServer) startBiometricResultWorker(

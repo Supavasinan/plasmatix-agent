@@ -17,12 +17,14 @@ import (
 )
 
 const (
-	maxSecretADMSCommands        = 16
-	maxBiometricClaimBodyBytes   = 64 * 1024
-	maxBiometricErrorBodyBytes   = 4 * 1024
-	biometricResultMaxAttempts   = 3
-	biometricResultHTTPTimeout   = 10 * time.Second
-	biometricDeliveryHTTPTimeout = 15 * time.Second
+	maxSecretADMSCommands         = 16
+	maxSecretACKBodyBytes         = 256
+	maxSecretCommandServeAttempts = 3
+	secretCommandServeDeadline    = 30 * time.Second
+	maxBiometricClaimBodyBytes    = 64 * 1024
+	maxBiometricErrorBodyBytes    = 4 * 1024
+	biometricResultHTTPTimeout    = 10 * time.Second
+	biometricDeliveryHTTPTimeout  = 15 * time.Second
 )
 
 type biometricDeploymentCommandContextKey struct{}
@@ -73,14 +75,16 @@ type biometricDeploymentMetadata struct {
 }
 
 type secretADMSCommand struct {
-	id           int
-	deviceSN     string
-	deploymentID string
-	commandID    string
-	sha256       string
-	metadata     biometricDeploymentMetadata
-	payloadMu    sync.Mutex
-	payload      []byte
+	id            int
+	deviceSN      string
+	deploymentID  string
+	commandID     string
+	sha256        string
+	metadata      biometricDeploymentMetadata
+	payloadMu     sync.Mutex
+	payload       []byte
+	firstServedAt time.Time
+	serveAttempts int
 }
 
 func (command *secretADMSCommand) zeroPayload() {
@@ -243,7 +247,12 @@ func (a *Agent) ProcessBiometricDeployment(
 		}
 	}()
 
-	claimed, err := a.claimBiometricDeployment(ctx, deploymentID, deviceSN)
+	claimed, err := a.claimBiometricDeployment(
+		ctx,
+		deploymentID,
+		deviceSN,
+		commandID,
+	)
 	if err != nil {
 		return err
 	}
@@ -360,14 +369,17 @@ func (a *Agent) ProcessBiometricDeployment(
 func (a *Agent) claimBiometricDeployment(
 	ctx context.Context,
 	deploymentID,
-	deviceSN string,
+	deviceSN,
+	expectedCommandID string,
 ) (*claimedBiometricDeployment, error) {
 	requestBody, err := json.Marshal(struct {
-		DeploymentID string `json:"deploymentId"`
-		DeviceSN     string `json:"deviceSn"`
+		DeploymentID      string `json:"deploymentId"`
+		DeviceSN          string `json:"deviceSn"`
+		ExpectedCommandID string `json:"expectedCommandId"`
 	}{
-		DeploymentID: deploymentID,
-		DeviceSN:     deviceSN,
+		DeploymentID:      deploymentID,
+		DeviceSN:          deviceSN,
+		ExpectedCommandID: expectedCommandID,
 	})
 	if err != nil {
 		return nil, deliveryError("deployment_claim_failed")
@@ -413,7 +425,8 @@ func (a *Agent) claimBiometricDeployment(
 		return nil, deliveryError("invalid_deployment_claim")
 	}
 	claimed := body.Deployments[0]
-	if !validBiometricUUID(claimed.CommandID) {
+	if !validBiometricUUID(claimed.CommandID) ||
+		claimed.CommandID != expectedCommandID {
 		return nil, deliveryError("stale_deployment_command")
 	}
 	if !validClaimedBiometricDeployment(claimed, deploymentID, deviceSN) {
@@ -491,11 +504,15 @@ func (a *Agent) fetchBiometricDeploymentPayload(
 	if response.StatusCode != http.StatusOK {
 		return nil, biometricHTTPError(response, "payload_delivery_failed")
 	}
+	if response.ContentLength < 0 ||
+		response.ContentLength != int64(metadata.ByteCount) {
+		return nil, deliveryError("payload_size_mismatch")
+	}
 
 	payload, err := io.ReadAll(io.LimitReader(response.Body, int64(limit)+1))
 	if err != nil {
 		zeroBytes(payload)
-		return nil, classifyBiometricRequestError(ctx, "payload_delivery_failed")
+		return nil, classifyBiometricRequestError(ctx, "network_unavailable")
 	}
 	if len(payload) > limit {
 		zeroBytes(payload)
@@ -531,15 +548,21 @@ func matchesBiometricPayloadHeaders(
 	metadata biometricDeploymentMetadata,
 ) bool {
 	headers := response.Header
-	return headers.Get("Content-Type") == "application/octet-stream" &&
-		headers.Get("Cache-Control") == "no-store" &&
-		headers.Get("X-Asset-Kind") == metadata.Kind &&
-		headers.Get("X-Biometric-Type") == strconv.Itoa(metadata.BioType) &&
-		headers.Get("X-Slot-Index") == strconv.Itoa(metadata.SlotIndex) &&
-		headers.Get("X-Algorithm-Family") == metadata.AlgorithmFamily &&
-		headers.Get("X-Algorithm-Major") == strconv.Itoa(metadata.AlgorithmMajor) &&
-		headers.Get("X-Algorithm-Minor") == strconv.Itoa(metadata.AlgorithmMinor) &&
-		headers.Get("X-Asset-Format") == metadata.Format
+	return exactBiometricHeader(headers, "Content-Type", "application/octet-stream") &&
+		exactBiometricHeader(headers, "Cache-Control", "no-store") &&
+		exactBiometricHeader(headers, "X-Content-SHA256", metadata.SHA256) &&
+		exactBiometricHeader(headers, "X-Asset-Kind", metadata.Kind) &&
+		exactBiometricHeader(headers, "X-Biometric-Type", strconv.Itoa(metadata.BioType)) &&
+		exactBiometricHeader(headers, "X-Slot-Index", strconv.Itoa(metadata.SlotIndex)) &&
+		exactBiometricHeader(headers, "X-Algorithm-Family", metadata.AlgorithmFamily) &&
+		exactBiometricHeader(headers, "X-Algorithm-Major", strconv.Itoa(metadata.AlgorithmMajor)) &&
+		exactBiometricHeader(headers, "X-Algorithm-Minor", strconv.Itoa(metadata.AlgorithmMinor)) &&
+		exactBiometricHeader(headers, "X-Asset-Format", metadata.Format)
+}
+
+func exactBiometricHeader(headers http.Header, name, expected string) bool {
+	values := headers.Values(name)
+	return len(values) == 1 && values[0] == expected
 }
 
 func biometricDeploymentSizeLimit(kind string) int {
@@ -781,11 +804,14 @@ func validDeliveryIdentifier(value string) bool {
 }
 
 func validDeliveryToken(value string) bool {
-	if len(value) != base64.RawURLEncoding.EncodedLen(32) {
+	encoding := base64.RawURLEncoding.Strict()
+	if len(value) != encoding.EncodedLen(32) {
 		return false
 	}
-	decoded, err := base64.RawURLEncoding.DecodeString(value)
-	valid := err == nil && len(decoded) == 32
+	decoded, err := encoding.DecodeString(value)
+	valid := err == nil &&
+		len(decoded) == 32 &&
+		encoding.EncodeToString(decoded) == value
 	zeroBytes(decoded)
 	return valid
 }
@@ -835,6 +861,14 @@ func (s *ADMSServer) reserveSecretCommand(commandID string) (bool, string) {
 	defer s.mu.Unlock()
 	if s.secretClosed {
 		return false, "deployment_cancelled"
+	}
+	if s.resultOutbox == nil || s.resultOutboxErr != nil {
+		return false, "deployment_delivery_unavailable"
+	}
+	if pendingResult, capacity := s.resultOutbox.admission(commandID); pendingResult {
+		return false, ""
+	} else if !capacity {
+		return false, "secret_command_queue_full"
 	}
 	if s.secretCmdID == nil {
 		s.secretCmdID = make(map[string]struct{})
@@ -907,9 +941,34 @@ func (s *ADMSServer) supersedeSecretDeployment(
 
 func (s *ADMSServer) popSecretCommand(deviceSN string) *secretADMSCommand {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	for key, command := range s.secretPending {
+		if key.DeviceSN != deviceSN {
+			continue
+		}
+		if command.serveAttempts >= maxSecretCommandServeAttempts ||
+			(!command.firstServedAt.IsZero() &&
+				time.Since(command.firstServedAt) >= secretCommandServeDeadline) {
+			delete(s.secretPending, key)
+			delete(s.secretCmdID, command.commandID)
+			command.zeroPayload()
+			s.mu.Unlock()
+			s.startBiometricResultWorker(biometricDeploymentResult{
+				Status:     "failed",
+				DeviceSN:   command.deviceSN,
+				SHA256:     command.sha256,
+				ErrorCode:  "network_unavailable",
+				CommandID:  command.commandID,
+				ReturnCode: -1,
+			}, command.deploymentID)
+			return nil
+		}
+		command.serveAttempts++
+		s.mu.Unlock()
+		return command
+	}
 	queue := s.secretCmdQueue[deviceSN]
 	if len(queue) == 0 {
+		s.mu.Unlock()
 		return nil
 	}
 	command := queue[0]
@@ -921,6 +980,9 @@ func (s *ADMSServer) popSecretCommand(deviceSN string) *secretADMSCommand {
 		DeviceSN: deviceSN,
 		LocalID:  command.id,
 	}] = command
+	command.firstServedAt = time.Now()
+	command.serveAttempts = 1
+	s.mu.Unlock()
 	return command
 }
 
@@ -964,12 +1026,13 @@ func (s *ADMSServer) failServedSecretCommand(
 	key := pendingCommandKey{DeviceSN: command.deviceSN, LocalID: command.id}
 	s.mu.Lock()
 	current, exists := s.secretPending[key]
-	if exists && current == command {
+	removed := exists && current == command
+	if removed {
 		delete(s.secretPending, key)
 	}
 	command.zeroPayload()
 	s.mu.Unlock()
-	if exists {
+	if removed {
 		s.startBiometricResultWorker(biometricDeploymentResult{
 			Status:     "failed",
 			DeviceSN:   command.deviceSN,
@@ -1012,7 +1075,7 @@ func (s *ADMSServer) completeSecretCommand(
 }
 
 func (s *ADMSServer) reportBiometricDeploymentFailure(
-	ctx context.Context,
+	_ context.Context,
 	deploymentID,
 	deviceSN,
 	commandID,
@@ -1027,7 +1090,7 @@ func (s *ADMSServer) reportBiometricDeploymentFailure(
 		CommandID:  commandID,
 		ReturnCode: -1,
 	}
-	_ = s.reportBiometricDeploymentResult(ctx, deploymentID, result)
+	s.startBiometricResultWorker(result, deploymentID)
 }
 
 func (a *Agent) reportBiometricDeploymentFailure(
@@ -1055,82 +1118,132 @@ func (s *ADMSServer) startBiometricResultWorker(
 	result biometricDeploymentResult,
 	deploymentID string,
 ) {
-	ctx, admitted := s.startBiometricDeliveryWorker()
-	if !admitted {
-		s.releaseSecretCommand(result.CommandID)
+	s.releaseSecretCommand(result.CommandID)
+	if s.resultOutbox == nil {
 		return
 	}
-	go func() {
-		defer s.biometricDeliveryWorkers.Done()
-		defer s.releaseSecretCommand(result.CommandID)
-		_ = s.reportBiometricDeploymentResult(ctx, deploymentID, result)
-	}()
+	if err := s.resultOutbox.enqueue(deploymentID, result, time.Now()); err != nil {
+		s.disableBiometricResultOutbox(err)
+		return
+	}
+	s.wakeBiometricResultOutbox()
 }
 
-func (s *ADMSServer) reportBiometricDeploymentResult(
-	ctx context.Context,
-	deploymentID string,
-	result biometricDeploymentResult,
-) error {
-	body, err := json.Marshal(result)
-	if err != nil {
-		return deliveryError("deployment_result_failed")
+func (s *ADMSServer) hasPendingSecretCommand(deviceSN string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key := range s.secretPending {
+		if key.DeviceSN == deviceSN {
+			return true
+		}
 	}
-	defer zeroBytes(body)
-	endpoint := strings.TrimRight(s.agent.config.PlamatixURL, "/") +
-		"/api/agent-bridge/biometric-vault/deployments/" +
-		deploymentID + "/result"
+	return false
+}
 
-	var lastErr error
-	for attempt := 0; attempt < biometricResultMaxAttempts; attempt++ {
-		if attempt > 0 {
-			timer := time.NewTimer(biometricResultRetryDelay(attempt))
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return deliveryError("deployment_cancelled")
-			case <-timer.C:
+func (s *ADMSServer) pendingSecretCommandID(deviceSN string, localID int) bool {
+	s.mu.Lock()
+	_, exists := s.secretPending[pendingCommandKey{
+		DeviceSN: deviceSN,
+		LocalID:  localID,
+	}]
+	s.mu.Unlock()
+	return exists
+}
+
+func (s *ADMSServer) handleSecretDeviceCommandACK(
+	deviceSN string,
+	body []byte,
+) (handled, accepted bool) {
+	defer zeroBytes(body)
+	localID, returnCode, valid := parseSecretDeviceCommandACK(body)
+	if localID <= 0 || !s.pendingSecretCommandID(deviceSN, localID) {
+		return false, false
+	}
+	if !valid {
+		return true, false
+	}
+	return true, s.completeSecretCommand(
+		pendingCommandKey{DeviceSN: deviceSN, LocalID: localID},
+		returnCode,
+	)
+}
+
+func parseSecretDeviceCommandACK(body []byte) (localID, returnCode int, valid bool) {
+	if len(body) == 0 || len(body) > maxSecretACKBodyBytes {
+		return inspectSecretDeviceCommandID(body), 0, false
+	}
+	fields := bytes.Split(body, []byte{'&'})
+	if len(fields) != 2 {
+		return inspectSecretDeviceCommandID(body), 0, false
+	}
+	seenID, seenReturn := false, false
+	for _, field := range fields {
+		key, value, found := bytes.Cut(field, []byte{'='})
+		if !found || len(key) == 0 || len(value) == 0 {
+			return inspectSecretDeviceCommandID(body), 0, false
+		}
+		switch {
+		case bytes.Equal(key, []byte("ID")) && !seenID:
+			parsed, ok := strictACKInteger(value, 1, int(^uint32(0)>>1))
+			if !ok {
+				return 0, 0, false
 			}
+			localID, seenID = parsed, true
+		case bytes.Equal(key, []byte("Return")) && !seenReturn:
+			parsed, ok := strictACKInteger(value, -1_000_000, 1_000_000)
+			if !ok {
+				return localID, 0, false
+			}
+			returnCode, seenReturn = parsed, true
+		default:
+			return inspectSecretDeviceCommandID(body), 0, false
 		}
-		request, requestErr := http.NewRequestWithContext(
-			ctx,
-			http.MethodPost,
-			endpoint,
-			bytes.NewReader(body),
-		)
-		if requestErr != nil {
-			return classifyBiometricRequestError(ctx, "deployment_result_failed")
-		}
-		request.Header.Set("Content-Type", "application/json")
-		request.Header.Set("X-API-Key", s.agent.config.APIKey)
-		response, requestErr := cloudHTTPClient(biometricResultHTTPTimeout).Do(request)
-		if requestErr != nil {
-			lastErr = classifyBiometricRequestError(ctx, "network_unavailable")
+	}
+	return localID, returnCode, seenID && seenReturn
+}
+
+func inspectSecretDeviceCommandID(body []byte) int {
+	for _, field := range bytes.Split(body, []byte{'&'}) {
+		key, value, found := bytes.Cut(field, []byte{'='})
+		if !found || !bytes.Equal(key, []byte("ID")) {
 			continue
 		}
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxBiometricErrorBodyBytes))
-		_ = response.Body.Close()
-		if response.StatusCode == http.StatusOK {
-			return nil
+		parsed, ok := strictACKInteger(value, 1, int(^uint32(0)>>1))
+		if ok {
+			return parsed
 		}
-		if response.StatusCode >= 400 && response.StatusCode < 500 {
-			return deliveryError("deployment_result_rejected")
-		}
-		lastErr = deliveryError("deployment_result_failed")
 	}
-	if lastErr != nil {
-		return lastErr
-	}
-	return deliveryError("deployment_result_failed")
+	return 0
 }
 
-func biometricResultRetryDelay(attempt int) time.Duration {
-	switch attempt {
-	case 1:
-		return 100 * time.Millisecond
-	default:
-		return 300 * time.Millisecond
+func strictACKInteger(value []byte, minimum, maximum int) (int, bool) {
+	if len(value) == 0 {
+		return 0, false
 	}
+	negative := false
+	index := 0
+	if value[0] == '-' {
+		negative = true
+		index = 1
+		if index == len(value) {
+			return 0, false
+		}
+	}
+	number := 0
+	for ; index < len(value); index++ {
+		if value[index] < '0' || value[index] > '9' {
+			return 0, false
+		}
+		digit := int(value[index] - '0')
+		if number > (maximum+1-digit)/10 {
+			return 0, false
+		}
+		number = number*10 + digit
+	}
+	if negative {
+		number = -number
+	}
+	return number, number >= minimum && number <= maximum
 }
 
 func (s *ADMSServer) startBiometricDeliveryProcess(

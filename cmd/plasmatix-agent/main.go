@@ -23,7 +23,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -280,7 +279,7 @@ type deviceSyncState struct {
 }
 
 func main() {
-	configPath := flag.String("config", "/etc/plasmatix/agent.yaml", "Path to agent config")
+	configPath := flag.String("config", defaultConfigPath, "Path to agent config")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -296,6 +295,10 @@ func main() {
 
 	logs := newLogBuffer(500)
 	log.SetOutput(io.MultiWriter(os.Stderr, logs))
+
+	// Clear any binary parked by a previous self-update (Windows only — see
+	// installUpdate). Safe to call before we know whether we're a service.
+	cleanupAfterUpdate()
 
 	agent := &Agent{
 		config:    cfg,
@@ -316,22 +319,26 @@ func main() {
 
 	log.Printf("plasmatix-agent %s starting (mode: %s)", version, cfg.Mode)
 
-	if cfg.Mode == "adms" {
-		go agent.startADMSServer()
-		// Active TCP probe is only useful when the agent has device IPs to
-		// probe — those come from incoming ADMS requests.
-		go agent.runProbeLoop(context.Background())
-	}
-	if cfg.Mode == "zkbiotime" {
-		// Pull ZKBioTime transactions periodically and relay them to /attlog.
-		go agent.runZKBioTimePollLoop(context.Background())
-	}
+	// runAgent hands the loops to the platform's service supervisor: a plain
+	// foreground call under systemd, the Service Control Manager on Windows.
+	runAgent(func() {
+		if cfg.Mode == "adms" {
+			go agent.startADMSServer()
+			// Active TCP probe is only useful when the agent has device IPs to
+			// probe — those come from incoming ADMS requests.
+			go agent.runProbeLoop(context.Background())
+		}
+		if cfg.Mode == "zkbiotime" {
+			// Pull ZKBioTime transactions periodically and relay them to /attlog.
+			go agent.runZKBioTimePollLoop(context.Background())
+		}
 
-	// Heartbeat runs in both modes — it carries the agent's own liveness
-	// even when no devices are tracked.
-	go agent.runHeartbeatLoop(context.Background())
+		// Heartbeat runs in both modes — it carries the agent's own liveness
+		// even when no devices are tracked.
+		go agent.runHeartbeatLoop(context.Background())
 
-	agent.connectLoop()
+		agent.connectLoop()
+	})
 }
 
 func loadConfig(path string) (Config, error) {
@@ -1994,7 +2001,7 @@ func (a *Agent) handleCommand(requestId, command string, params map[string]strin
 			result = map[string]any{"status": "restarting"}
 			// Send response first, then restart
 			a.postResponse(requestId, result, nil)
-			a.restartService()
+			restartService()
 			return
 		}
 	case "uninstall":
@@ -2234,43 +2241,19 @@ func (a *Agent) collectSystemInfo() map[string]any {
 		info["hostname"] = h
 	}
 
-	// OS release info
-	if data, err := os.ReadFile("/etc/os-release"); err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(line, "PRETTY_NAME=") {
-				info["osRelease"] = strings.Trim(strings.TrimPrefix(line, "PRETTY_NAME="), `"`)
-				break
-			}
-		}
-	}
-
-	// Memory info (Linux)
-	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
-		mem := map[string]string{}
-		for _, line := range strings.Split(string(data), "\n") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				key := strings.TrimSpace(parts[0])
-				val := strings.TrimSpace(parts[1])
-				if key == "MemTotal" || key == "MemAvailable" {
-					mem[key] = val
-				}
-			}
-		}
-		info["memTotal"] = mem["MemTotal"]
-		info["memAvailable"] = mem["MemAvailable"]
-	}
+	// OS release and memory info — sourced per-platform.
+	collectPlatformInfo(info)
 
 	// CPU count
 	info["cpus"] = runtime.NumCPU()
 
 	// Config path
-	info["configPath"] = "/etc/plasmatix/agent.json"
-	info["binPath"] = "/usr/local/bin/plasmatix-agent"
+	info["configPath"] = agentConfigPath
+	info["binPath"] = agentBinPath
 
-	// Systemd service status
-	if out, err := exec.Command("systemctl", "is-active", "plasmatix-agent").Output(); err == nil {
-		info["serviceStatus"] = strings.TrimSpace(string(out))
+	// Service status, normalized to systemd's vocabulary on every platform.
+	if status, ok := serviceStatus(); ok {
+		info["serviceStatus"] = status
 	}
 
 	return info
@@ -2285,13 +2268,22 @@ func cloudHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{Timeout: timeout}
 }
 
-func (a *Agent) selfUpdate() error {
-	binPath := "/usr/local/bin/plasmatix-agent"
-	goos := runtime.GOOS
-	goarch := runtime.GOARCH
+// releaseAssetName is the filename this host should pull from /api/releases.
+// It must match the names the release workflow uploads, and the allow-list
+// regex the Plasmatix release proxy validates against.
+func releaseAssetName() string {
+	name := fmt.Sprintf("plasmatix-agent-%s-%s", runtime.GOOS, runtime.GOARCH)
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	return name
+}
 
-	downloadURL := fmt.Sprintf("%s/api/releases/plasmatix-agent-%s-%s",
-		a.config.PlamatixURL, goos, goarch)
+func (a *Agent) selfUpdate() error {
+	binPath := agentBinPath
+
+	downloadURL := fmt.Sprintf("%s/api/releases/%s",
+		a.config.PlamatixURL, releaseAssetName())
 
 	log.Printf("Downloading new binary from %s...", downloadURL)
 
@@ -2307,8 +2299,14 @@ func (a *Agent) selfUpdate() error {
 		return fmt.Errorf("download failed (HTTP %d)", resp.StatusCode)
 	}
 
-	// Write to temp file in the same directory (ensures same filesystem for rename)
-	tmpFile, err := os.CreateTemp(filepath.Dir(binPath), "plasmatix-agent-update-*")
+	// Write to temp file in the same directory (ensures same filesystem for rename).
+	// The .exe suffix is not cosmetic on Windows: CreateProcess refuses to run an
+	// image without it, so the --version verification below would fail.
+	tmpPattern := "plasmatix-agent-update-*"
+	if runtime.GOOS == "windows" {
+		tmpPattern += ".exe"
+	}
+	tmpFile, err := os.CreateTemp(filepath.Dir(binPath), tmpPattern)
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
 	}
@@ -2336,52 +2334,24 @@ func (a *Agent) selfUpdate() error {
 	newVersion := strings.TrimSpace(string(out))
 	log.Printf("New binary version: %s (current: %s)", newVersion, version)
 
-	// Atomic replace: rename over existing binary
-	if err := os.Rename(tmpPath, binPath); err != nil {
+	// Swap the new binary in. Unix renames straight over the running image;
+	// Windows has to move the running image aside first (see installUpdate).
+	if err := installUpdate(tmpPath, binPath); err != nil {
 		os.Remove(tmpPath)
-		return fmt.Errorf("replace binary: %w", err)
+		return err
 	}
 
 	log.Println("Binary updated successfully")
 	return nil
 }
 
-func (a *Agent) restartService() {
-	time.Sleep(time.Second)
-	log.Println("Restarting service...")
-	cmd := exec.Command("systemctl", "restart", "plasmatix-agent")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		log.Printf("restart failed: %v — exiting to let systemd restart us", err)
-		os.Exit(1)
-	}
-}
-
 func (a *Agent) selfUninstall() {
-	// Write a detached cleanup script that runs after this process is killed.
-	// We can't do cleanup inline because `systemctl stop` sends SIGTERM to us.
-	script := `#!/bin/bash
-sleep 2
-systemctl stop plasmatix-agent 2>/dev/null
-systemctl disable plasmatix-agent 2>/dev/null
-rm -f /etc/systemd/system/plasmatix-agent.service
-systemctl daemon-reload 2>/dev/null
-rm -rf /etc/plasmatix
-rm -f /usr/local/bin/plasmatix-agent
-rm -f /tmp/plasmatix-uninstall.sh
-`
-	scriptPath := "/tmp/plasmatix-uninstall.sh"
-	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
-		log.Printf("uninstall: write script: %v", err)
-		return
-	}
-
+	// The cleanup runs in a detached child, not inline: stopping the service
+	// kills this process (SIGTERM under systemd, TerminateProcess under the SCM),
+	// so anything after the stop would never execute.
 	log.Println("Launching detached uninstall script...")
-	cmd := exec.Command("bash", scriptPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		log.Printf("uninstall: start script: %v", err)
+	if err := launchUninstaller(); err != nil {
+		log.Printf("uninstall: %v", err)
 		return
 	}
 

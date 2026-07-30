@@ -8,14 +8,18 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	zk "github.com/Supavasinan/zkbiotime-go"
 )
+
+const maxSafeJSONInteger int64 = 1<<53 - 1
 
 // ZKBioTimeClient talks to a ZKBioTime / BioTime 8 server via the zkbiotime-go
 // SDK. It is used when the agent runs in mode "zkbiotime". Credentials arrive in
@@ -286,41 +290,49 @@ func (c *ZKBioTimeClient) fetchAttReport(ctx context.Context, start, end string)
 	return map[string]any{"count": rep.Count, "data": rep.Data}, nil
 }
 
-// fetchTransactions pulls raw punches in a time window (paginated).
-func (c *ZKBioTimeClient) fetchTransactions(ctx context.Context, start, end string) ([]map[string]any, error) {
-	var all []map[string]any
-	page := 1
-	for {
-		q := url.Values{
-			"start_time": {start},
-			"end_time":   {end},
-			"page":       {strconv.Itoa(page)},
-			"page_size":  {"500"},
-		}
-		code, body, err := c.do(ctx, http.MethodGet, "/iclock/api/transactions/", q, nil)
-		if err != nil {
-			return nil, err
-		}
-		if code != http.StatusOK {
-			return nil, fmt.Errorf("GET transactions (HTTP %d): %s", code, truncate(string(body), 160))
-		}
-		var out struct {
-			Next string           `json:"next"`
-			Data []map[string]any `json:"data"`
-		}
-		if err := json.Unmarshal(body, &out); err != nil {
-			return nil, err
-		}
-		all = append(all, out.Data...)
-		if out.Next == "" || len(out.Data) == 0 {
-			break
-		}
-		page++
-		if page > 200 { // safety
-			break
-		}
+func (c *ZKBioTimeClient) fetchTransactionsAfterID(
+	ctx context.Context,
+	cursor int64,
+) ([]map[string]any, error) {
+	q := url.Values{
+		"last_id":   {strconv.FormatInt(cursor, 10)},
+		"ordering":  {"id"},
+		"page_size": {"500"},
 	}
-	return all, nil
+	code, body, err := c.do(
+		ctx,
+		http.MethodGet,
+		"/iclock/api/transactions/",
+		q,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if code != http.StatusOK {
+		return nil, fmt.Errorf(
+			"GET transactions (HTTP %d): %s",
+			code,
+			truncate(string(body), 160),
+		)
+	}
+
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return nil, err
+	}
+	if len(envelope.Data) == 0 ||
+		bytes.Equal(bytes.TrimSpace(envelope.Data), []byte("null")) {
+		return nil, fmt.Errorf("GET transactions has missing or null data")
+	}
+
+	var rows []map[string]any
+	if err := json.Unmarshal(envelope.Data, &rows); err != nil {
+		return nil, fmt.Errorf("decode transactions data: %w", err)
+	}
+	return rows, nil
 }
 
 // ── Command handlers ─────────────────────────────────────────────────────────
@@ -462,43 +474,40 @@ func (a *Agent) cmdZkbiotimeRequest(ctx context.Context, params map[string]strin
 	return map[string]any{"status": code, "body": parsed}, nil
 }
 
-// ── Transaction poll loop (Phase 0 pull) ─────────────────────────────────────
+// ── Transaction poll loop ────────────────────────────────────────────────────
 
-// runZKBioTimePollLoop periodically pulls new transactions and relays them to
-// /api/agent-bridge/attlog as {type:"zkbiotime", data:[...]}. A sliding overlap
-// + the server-side natural-key dedup make re-polls idempotent.
+// runZKBioTimePollLoop periodically catches up from the durable transaction ID
+// acknowledged by the bridge. The cursor only advances after the bridge accepts
+// each batch, so delayed punches and retries cannot create permanent gaps.
 func (a *Agent) runZKBioTimePollLoop(ctx context.Context) {
 	c := a.zkbiotime
 	if c == nil {
 		return
 	}
-	const layout = "2006-01-02 15:04:05"
-	const overlap = 2 * time.Minute
 	const interval = 60 * time.Second
 
-	hwm := time.Now().Add(-24 * time.Hour)
+	var cursor int64
+	cursorLoaded := false
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	pull := func() {
-		now := time.Now()
-		start := hwm.Add(-overlap).Format(layout)
-		end := now.Format(layout)
-		txns, err := c.fetchTransactions(ctx, start, end)
+		if !cursorLoaded {
+			lastTransactionID, err := a.fetchZKBioTimeLastTransactionID(ctx)
+			if err != nil {
+				log.Printf("[zkbiotime] fetch transaction cursor: %v", err)
+				return
+			}
+			cursor = lastTransactionID
+			cursorLoaded = true
+		}
+
+		nextCursor, err := a.catchUpZKBioTimeTransactions(ctx, c, cursor)
 		if err != nil {
-			log.Printf("[zkbiotime] pull transactions: %v", err)
+			log.Printf("[zkbiotime] catch up transactions: %v", err)
 			return
 		}
-		if len(txns) == 0 {
-			hwm = now
-			return
-		}
-		if err := a.relayZKBioTimeTransactions(ctx, txns); err != nil {
-			log.Printf("[zkbiotime] relay attlog: %v", err)
-			return
-		}
-		log.Printf("[zkbiotime] relayed %d transactions", len(txns))
-		hwm = now
+		cursor = nextCursor
 	}
 
 	pull()
@@ -512,8 +521,128 @@ func (a *Agent) runZKBioTimePollLoop(ctx context.Context) {
 	}
 }
 
-func (a *Agent) relayZKBioTimeTransactions(ctx context.Context, txns []map[string]any) error {
-	payload := map[string]any{"type": "zkbiotime", "data": txns}
+func zkbioTransactionID(row map[string]any) (int64, error) {
+	raw, ok := row["id"]
+	if !ok {
+		return 0, fmt.Errorf("transaction is missing id")
+	}
+	value, ok := raw.(float64)
+	if !ok ||
+		value <= 0 ||
+		value != math.Trunc(value) ||
+		value > float64(maxSafeJSONInteger) {
+		return 0, fmt.Errorf("invalid transaction id %v", raw)
+	}
+	return int64(value), nil
+}
+
+func prepareZKBioTimeBatch(
+	rows []map[string]any,
+	cursor int64,
+) ([]map[string]any, int64, error) {
+	newer := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		id, err := zkbioTransactionID(row)
+		if err != nil {
+			return nil, cursor, err
+		}
+		if id > cursor {
+			newer = append(newer, row)
+		}
+	}
+
+	sort.Slice(newer, func(i, j int) bool {
+		left, _ := zkbioTransactionID(newer[i])
+		right, _ := zkbioTransactionID(newer[j])
+		return left < right
+	})
+	if len(newer) == 0 {
+		return newer, cursor, nil
+	}
+
+	next, _ := zkbioTransactionID(newer[len(newer)-1])
+	return newer, next, nil
+}
+
+func (a *Agent) catchUpZKBioTimeTransactions(
+	ctx context.Context,
+	c *ZKBioTimeClient,
+	cursor int64,
+) (int64, error) {
+	for {
+		rows, err := c.fetchTransactionsAfterID(ctx, cursor)
+		if err != nil {
+			return cursor, fmt.Errorf("pull transactions after ID %d: %w", cursor, err)
+		}
+
+		txns, nextCursor, err := prepareZKBioTimeBatch(rows, cursor)
+		if err != nil {
+			return cursor, fmt.Errorf("prepare transactions after ID %d: %w", cursor, err)
+		}
+		if len(txns) == 0 {
+			return cursor, nil
+		}
+
+		if err := a.relayZKBioTimeTransactions(ctx, txns, nextCursor); err != nil {
+			return cursor, fmt.Errorf("relay attlog through ID %d: %w", nextCursor, err)
+		}
+		log.Printf(
+			"[zkbiotime] relayed %d transactions through ID %d",
+			len(txns),
+			nextCursor,
+		)
+		cursor = nextCursor
+	}
+}
+
+func (a *Agent) fetchZKBioTimeLastTransactionID(ctx context.Context) (int64, error) {
+	checkpointURL := fmt.Sprintf("%s/api/agent-bridge/zkbiotime/checkpoint", a.config.PlamatixURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checkpointURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("X-API-Key", a.config.APIKey)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(res.Body)
+		return 0, fmt.Errorf("checkpoint HTTP %d: %s", res.StatusCode, truncate(string(body), 200))
+	}
+
+	var response struct {
+		LastTransactionID json.RawMessage `json:"lastTransactionId"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+		return 0, fmt.Errorf("decode checkpoint: %w", err)
+	}
+	if len(response.LastTransactionID) == 0 {
+		return 0, fmt.Errorf("decode checkpoint: missing lastTransactionId")
+	}
+	if bytes.Equal(bytes.TrimSpace(response.LastTransactionID), []byte("null")) {
+		return 0, nil
+	}
+
+	var cursor int64
+	if err := json.Unmarshal(response.LastTransactionID, &cursor); err != nil {
+		return 0, fmt.Errorf("decode lastTransactionId: %w", err)
+	}
+	if cursor < 0 {
+		return 0, fmt.Errorf("lastTransactionId must not be negative")
+	}
+	return cursor, nil
+}
+
+func (a *Agent) relayZKBioTimeTransactions(ctx context.Context, txns []map[string]any, lastTransactionID int64) error {
+	payload := map[string]any{
+		"type":              "zkbiotime",
+		"data":              txns,
+		"lastTransactionId": lastTransactionID,
+	}
 	body, _ := json.Marshal(payload)
 	attURL := fmt.Sprintf("%s/api/agent-bridge/attlog", a.config.PlamatixURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, attURL, bytes.NewReader(body))

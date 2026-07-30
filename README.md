@@ -8,17 +8,35 @@ network.
 
 - Reverse SSE connection (agent initiates outbound, no inbound ports needed)
 - ZKBio session caching with auto-relogin
+- Durable ZKBioTime sync checkpoints, so an Agent restart resumes from Plasmatix's last acknowledged batch
 - Remote commands: employee sync, attendance transactions, daily/monthly reports
 - Self-update and self-uninstall via remote commands
-- Systemd service integration
+- Runs as a native service: systemd on Linux, Service Control Manager on Windows
 - Adaptive TA PUSH 2.x / AC PUSH 3.x protocol detection
 - Profile-aware fingerprint enrollment, write, and delete commands
+- Encrypted biometric vault delivery: typed commands, live compatibility checks, in-memory rendering
 - Durable JPEG/PNG scanner photo forwarding
 - Read-only ZKBioTime PostgreSQL migration preflight and extraction
 
+## Supported platforms
+
+| Platform | Service | Layout |
+| --- | --- | --- |
+| Linux (amd64/arm64) | systemd unit `plasmatix-agent` | bin `/usr/local/bin/plasmatix-agent`, config `/etc/plasmatix/agent.json` |
+| Windows (amd64/arm64) | SCM service `PlasmatixAgent` | bin `%ProgramFiles%\Plasmatix\plasmatix-agent.exe`, config `%ProgramData%\Plasmatix\agent.json` |
+| macOS (amd64/arm64) | none — binary only, run in the foreground | — |
+
+Windows supports the `zkbio` and `zkbiotime` modes. ADMS mode is Linux-only: it
+needs an inbound listener, which the Windows installer deliberately does not
+open a firewall rule for.
+
+Platform-specific behavior (paths, service control, self-update, uninstall) is
+isolated in `platform_unix.go` / `platform_windows.go` behind one small
+interface — `main.go` stays OS-agnostic.
+
 ## Installation
 
-The agent is installed via a generated script from the Plasmatix web UI. Go to **Settings > Agent**, configure your ZKBio connection, then copy the install command.
+The agent is installed via a generated script from the Plasmatix web UI. Go to **Settings > Agent**, configure your ZKBio connection, then copy the install command (bash for Linux, PowerShell for Windows).
 
 ## Manual build
 

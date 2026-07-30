@@ -2,6 +2,7 @@
   "api_key": "REPLACE_WITH_AGENT_API_KEY_FROM_PLASMATIX",
   "plasmatix_url": "http://localhost:3000",
   "mode": "adms",
+  "migration_dsn": "postgres://readonly_user:CHANGE_ME@127.0.0.1:5432/zkbiotime?sslmode=disable",
   "adms_port": 8081,
   "port": 9800
 }

@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,9 @@ import (
 var version = "dev"
 
 const sessionTTL = 10 * time.Minute
+const maxBiometricCDataBodyBytes = 8 * 1024 * 1024
+const maxConcurrentBiometricUploads = 4
+const maxQueuedBiometricUploads = 16
 
 type Config struct {
 	APIKey        string
@@ -35,6 +39,7 @@ type Config struct {
 	ZKBioURL      string
 	ZKBioUsername string
 	ZKBioPassword string
+	MigrationDSN  string
 	Port          int
 	Mode          string
 	ADMSPort      int
@@ -42,6 +47,7 @@ type Config struct {
 
 type Agent struct {
 	config    Config
+	stateDir  string
 	startedAt time.Time
 	sessions  *SessionManager
 	zkbiotime *ZKBioTimeClient
@@ -168,13 +174,34 @@ type SessionManager struct {
 }
 
 type ADMSServer struct {
-	agent        *Agent
-	mu           sync.Mutex
-	cmdQueue     map[string][]ADMSCommand
-	cmdID        int
-	pendingCmd   map[int]ADMSCommand
-	cloudCmdID   map[string]struct{}
-	queryBuffers map[string][]byte
+	agent                    *Agent
+	mu                       sync.Mutex
+	cmdQueue                 map[string][]ADMSCommand
+	cmdID                    int
+	pendingCmd               map[pendingCommandKey]ADMSCommand
+	cloudCmdID               map[string]struct{}
+	queryBuffers             map[string][]byte
+	captureCmd               map[biometricCaptureKey]pendingBiometricCapture
+	biometricUploadQueue     chan biometricUploadJob
+	biometricUploadCtx       context.Context
+	biometricUploadStop      context.CancelFunc
+	biometricWorkers         sync.WaitGroup
+	biometricClosed          bool
+	secretCmdQueue           map[string][]*secretADMSCommand
+	secretPending            map[pendingCommandKey]*secretADMSCommand
+	secretCmdID              map[string]struct{}
+	biometricDeliveryCtx     context.Context
+	biometricDeliveryStop    context.CancelFunc
+	biometricDeliveryWorkers sync.WaitGroup
+	resultOutbox             *biometricResultOutbox
+	resultOutboxErr          error
+	resultEnqueuePending     map[string]pendingBiometricResult
+	resultOutboxWake         chan struct{}
+	resultOutboxStarted      bool
+	secretClosed             bool
+	secretNow                func() time.Time
+	secretAfterFunc          func(time.Duration, func()) func() bool
+	secretWriteTimeout       time.Duration
 }
 
 type ADMSCommand struct {
@@ -182,6 +209,31 @@ type ADMSCommand struct {
 	Command string
 	CloudID string
 	Label   string
+}
+
+type pendingCommandKey struct {
+	DeviceSN string
+	LocalID  int
+}
+
+type biometricCaptureKey struct {
+	DeviceSN string
+	PIN      string
+	BioType  int
+	Slot     int
+}
+
+type pendingBiometricCapture struct {
+	CloudID  string
+	Recorded time.Time
+}
+
+type biometricUploadJob struct {
+	asset             CapturedBiometricAsset
+	metadata          BiometricSafeMetadata
+	rowCount          int
+	incomingByteCount int
+	safeKeys          []string
 }
 
 type cloudCommand struct {
@@ -250,6 +302,7 @@ func main() {
 
 	agent := &Agent{
 		config:    cfg,
+		stateDir:  filepath.Dir(*configPath),
 		startedAt: time.Now(),
 		devices:   newDeviceTracker(),
 		logs:      logs,
@@ -300,6 +353,7 @@ func loadConfig(path string) (Config, error) {
 		ZKBioURL      string `json:"zkbio_url"`
 		ZKBioUsername string `json:"zkbio_username"`
 		ZKBioPassword string `json:"zkbio_password"`
+		MigrationDSN  string `json:"migration_dsn"`
 		Port          int    `json:"port"`
 		Mode          string `json:"mode"`
 		ADMSPort      int    `json:"adms_port"`
@@ -313,6 +367,7 @@ func loadConfig(path string) (Config, error) {
 			ZKBioURL:      jc.ZKBioURL,
 			ZKBioUsername: jc.ZKBioUsername,
 			ZKBioPassword: jc.ZKBioPassword,
+			MigrationDSN:  jc.MigrationDSN,
 			Port:          jc.Port,
 			Mode:          jc.Mode,
 			ADMSPort:      jc.ADMSPort,
@@ -361,6 +416,7 @@ func loadConfig(path string) (Config, error) {
 		ZKBioURL:      parsed["zkbio_url"],
 		ZKBioUsername: parsed["zkbio_username"],
 		ZKBioPassword: parsed["zkbio_password"],
+		MigrationDSN:  parsed["migration_dsn"],
 		Port:          port,
 		Mode:          parsed["mode"],
 		ADMSPort:      admsPort,
@@ -373,6 +429,7 @@ func normalizeConfig(cfg Config) (Config, error) {
 	cfg.ZKBioURL = strings.TrimRight(strings.TrimSpace(cfg.ZKBioURL), "/")
 	cfg.ZKBioUsername = strings.TrimSpace(cfg.ZKBioUsername)
 	cfg.ZKBioPassword = strings.TrimSpace(cfg.ZKBioPassword)
+	cfg.MigrationDSN = strings.TrimSpace(cfg.MigrationDSN)
 	cfg.Mode = strings.ToLower(strings.TrimSpace(cfg.Mode))
 	if cfg.Port == 0 {
 		cfg.Port = 9800
@@ -431,13 +488,25 @@ func (a *Agent) connectLoop() {
 }
 
 func (a *Agent) startADMSServer() {
-	a.adms = &ADMSServer{
-		agent:        a,
-		cmdQueue:     make(map[string][]ADMSCommand),
-		pendingCmd:   make(map[int]ADMSCommand),
-		cloudCmdID:   make(map[string]struct{}),
-		queryBuffers: make(map[string][]byte),
+	resultOutbox, resultOutboxErr := openBiometricResultOutbox(a.stateDir)
+	if resultOutboxErr != nil {
+		log.Printf("Biometric result outbox unavailable")
 	}
+	a.adms = &ADMSServer{
+		agent:                a,
+		cmdQueue:             make(map[string][]ADMSCommand),
+		pendingCmd:           make(map[pendingCommandKey]ADMSCommand),
+		cloudCmdID:           make(map[string]struct{}),
+		queryBuffers:         make(map[string][]byte),
+		captureCmd:           make(map[biometricCaptureKey]pendingBiometricCapture),
+		biometricUploadQueue: make(chan biometricUploadJob, maxQueuedBiometricUploads),
+		secretCmdQueue:       make(map[string][]*secretADMSCommand),
+		secretPending:        make(map[pendingCommandKey]*secretADMSCommand),
+		secretCmdID:          make(map[string]struct{}),
+		resultOutbox:         resultOutbox,
+		resultOutboxErr:      resultOutboxErr,
+	}
+	a.adms.startBiometricResultOutboxWorker()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/iclock/cdata", a.adms.handleCData)
@@ -447,13 +516,21 @@ func (a *Agent) startADMSServer() {
 	mux.HandleFunc("/iclock/ping", a.adms.handlePing)
 	mux.HandleFunc("/iclock/registry", a.adms.handleRegistry)
 	mux.HandleFunc("/iclock/push", a.adms.handlePush)
+	mux.HandleFunc("/iclock/fdata", a.adms.handleFData)
 	// Catch-all so any unknown /iclock/* path 200s instead of 404ing the
 	// device into a retry loop. Specific patterns above still take priority.
 	mux.HandleFunc("/iclock/", a.adms.handleICLockFallback)
 
 	addr := fmt.Sprintf(":%d", a.config.ADMSPort)
 	log.Printf("ADMS server listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+	server := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		WriteTimeout: secretCommandWriteTimeout,
+	}
+	if err := server.ListenAndServe(); err != nil {
+		a.adms.shutdownBiometricUploads()
+		a.adms.shutdownBiometricDelivery()
 		log.Fatalf("ADMS server error: %v", err)
 	}
 }
@@ -463,6 +540,15 @@ func (a *Agent) startADMSServer() {
 func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 	sn := r.URL.Query().Get("SN")
 	s.agent.devices.noteContact(sn, r.RemoteAddr)
+	pushVersion := r.URL.Query().Get("pushver")
+	if pushVersion == "" {
+		pushVersion = r.URL.Query().Get("PushVersion")
+	}
+	s.agent.devices.observeProtocol(sn, ProtocolObservation{
+		Path:         r.URL.Path,
+		PushVersion:  pushVersion,
+		Capabilities: capabilitiesFromQuery(r.URL.Query()),
+	})
 	w.Header().Set("Content-Type", "text/plain")
 
 	if r.Method == http.MethodGet {
@@ -499,9 +585,25 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method == http.MethodPost {
 		table := r.URL.Query().Get("table")
-		body, err := io.ReadAll(r.Body)
+		tableName := r.URL.Query().Get("tablename")
+		accepted := 0
+		bodyReader := io.Reader(r.Body)
+		biometricRequest := isBiometricCDataRequest(table, tableName, r.URL.Query().Get("type"))
+		if biometricRequest {
+			bodyReader = io.LimitReader(r.Body, maxBiometricCDataBodyBytes+1)
+		}
+		body, err := io.ReadAll(bodyReader)
 		if err != nil {
 			log.Printf("[ADMS] Error reading body: %v", err)
+			fmt.Fprint(w, "OK")
+			return
+		}
+		if biometricRequest && len(body) > maxBiometricCDataBodyBytes {
+			log.Printf(
+				"[ADMS] Biometric upload rejected: SN=%s body exceeds %d bytes",
+				safeBiometricLogIdentifier(sn),
+				maxBiometricCDataBodyBytes,
+			)
 			fmt.Fprint(w, "OK")
 			return
 		}
@@ -535,6 +637,7 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 				})
 			}
 			log.Printf("[ADMS] Received ATTLOG from SN=%s (%d rows)", sn, received)
+			accepted = received
 
 		case "rtlog":
 			received := 0
@@ -559,17 +662,25 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 				s.relayRtlog(rt)
 			}
 			log.Printf("[ADMS] Received rtlog from SN=%s (%d rows)", sn, received)
+			accepted = received
 
 		case "tabledata":
-			tableName := r.URL.Query().Get("tablename")
 			received := countADMSRows(body)
 			if received == 0 {
 				received = atoiOrZero(r.URL.Query().Get("count"))
 			}
-			log.Printf("[ADMS] Received table=tabledata tablename=%s from SN=%s (%d rows, %d bytes, query=%s)",
-				tableName, sn, received, len(body), r.URL.RawQuery)
+			log.Printf("[ADMS] Received table=tabledata tablename=%s from SN=%s (%d rows, %d bytes)",
+				safeProtocolLogValue(tableName), safeBiometricLogIdentifier(sn), received, len(body))
 			logTableDataPreview(sn, tableName, body)
 			if tableName != "" {
+				if strings.EqualFold(tableName, "BIODATA") ||
+					strings.EqualFold(tableName, "BIOPHOTO") ||
+					strings.EqualFold(tableName, "FINGERTMP") {
+					s.captureBiometricUploads(sn, tableName, body)
+					if strings.EqualFold(tableName, "BIODATA") {
+						s.reflectBioData(sn, body)
+					}
+				}
 				// Standard realtime table pushes must be acked with a bare
 				// "OK". ZAM70 / Push 3.0 firmware does not recognize the
 				// count-style ack ("user=1") as success for these, so the
@@ -578,42 +689,315 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 				// SN=NYU7253100765 spamming tablename=user pin=21). The
 				// "tablename=count" ack is only needed by the biometric
 				// template/photo tables (see commit 1f6d695).
-				if strings.EqualFold(tableName, "ATTPHOTO") ||
-					strings.EqualFold(tableName, "user") {
-					fmt.Fprint(w, "OK")
-					return
-				}
-				fmt.Fprintf(w, "%s=%d\n", tableName, received)
+				protocol, _ := s.agent.devices.protocolState(sn)
+				writeCDataAck(w, protocol.Profile, table, tableName, received)
 				return
 			}
 
+		case "FINGERTMP", "BIODATA", "BIOPHOTO":
+			accepted = countADMSRows(body)
+			s.captureBiometricUploads(sn, table, body)
+			if strings.EqualFold(table, "BIODATA") {
+				s.reflectBioData(sn, body)
+			}
+
 		default:
-			log.Printf("[ADMS] Received table=%s from SN=%s (%d bytes, query=%s)", table, sn, len(body), r.URL.RawQuery)
+			log.Printf("[ADMS] Received table=%s from SN=%s (%d bytes)",
+				safeProtocolLogValue(table), safeBiometricLogIdentifier(sn), len(body))
 			if table == "" {
-				logTableDataPreview(sn, "<empty>", body)
-				if strings.EqualFold(r.URL.Query().Get("type"), "BioData") {
+				queryType := r.URL.Query().Get("type")
+				if strings.EqualFold(queryType, "BioData") {
+					logTableDataPreview(sn, "BIODATA", body)
 					fields := parseFirstTabKVLine(body)
-					log.Printf("[ADMS] BioData upload: SN=%s rows=%d keys=%s", sn, countADMSRows(body), strings.Join(fieldKeys(fields), ","))
-					pin := firstField(fields, "PIN", "Pin", "pin")
-					bioType := atoiOrZero(firstField(fields, "TYPE", "Type", "type"))
-					templateNo := atoiOrZero(firstField(fields, "NO", "No", "no"))
-					if pin != "" && bioType > 0 {
-						go s.reportBiometricTemplateUpload(sn, pin, bioType, templateNo, countADMSRows(body), len(body), fieldKeys(fields))
-						// Echo the captured template back as DATA UPDATE BIODATA so the
-						// device commits it to its local matcher. SenseFace/Push 3.0
-						// firmware doesn't auto-persist on ENROLL_BIO — without this
-						// echo the per-user template count never advances and the
-						// finger never matches at punch time.
-						s.reflectBioData(sn, body)
-					}
+					log.Printf("[ADMS] BioData upload: SN=%s rows=%d keys=%s",
+						safeBiometricLogIdentifier(sn), countADMSRows(body),
+						strings.Join(safeBiometricFieldKeys(fields), ","))
+					s.captureBiometricUploads(sn, "BIODATA", body)
+					// Echo the captured template back as DATA UPDATE BIODATA so the
+					// device commits it to its local matcher. SenseFace/Push 3.0
+					// firmware doesn't auto-persist on ENROLL_BIO — without this
+					// echo the per-user template count never advances and the
+					// finger never matches at punch time.
+					s.reflectBioData(sn, body)
+				} else if strings.EqualFold(queryType, "BioPhoto") {
+					logTableDataPreview(sn, "BIOPHOTO", body)
+					s.captureBiometricUploads(sn, "BIOPHOTO", body)
+				} else {
+					logTableDataPreview(sn, "<empty>", body)
 				}
 			}
 		}
 
-		fmt.Fprint(w, "OK")
+		protocol, _ := s.agent.devices.protocolState(sn)
+		writeCDataAck(w, protocol.Profile, table, tableName, accepted)
 		return
 	}
 
+	fmt.Fprint(w, "OK")
+}
+
+func isBiometricCDataRequest(table, tableName, queryType string) bool {
+	if strings.EqualFold(table, "FINGERTMP") ||
+		strings.EqualFold(table, "BIODATA") ||
+		strings.EqualFold(table, "BIOPHOTO") {
+		return true
+	}
+	if strings.EqualFold(table, "tabledata") {
+		return strings.EqualFold(tableName, "FINGERTMP") ||
+			strings.EqualFold(tableName, "BIODATA") ||
+			strings.EqualFold(tableName, "BIOPHOTO")
+	}
+	return table == "" &&
+		(strings.EqualFold(queryType, "BioData") ||
+			strings.EqualFold(queryType, "BioPhoto"))
+}
+
+func safeBiometricFieldKeys(fields map[string]string) []string {
+	allowed := map[string]string{
+		"pin":            "PIN",
+		"userid":         "UserID",
+		"uid":            "UID",
+		"fid":            "FID",
+		"no":             "No",
+		"index":          "Index",
+		"type":           "Type",
+		"majorver":       "MajorVer",
+		"algorithmmajor": "AlgorithmMajor",
+		"minorver":       "MinorVer",
+		"algorithmminor": "AlgorithmMinor",
+		"format":         "Format",
+		"size":           "Size",
+		"valid":          "Valid",
+	}
+	safe := make([]string, 0, len(allowed))
+	seen := make(map[string]struct{}, len(allowed))
+	for key := range fields {
+		canonical, ok := allowed[strings.ToLower(strings.TrimSpace(key))]
+		if !ok {
+			continue
+		}
+		if _, duplicate := seen[canonical]; duplicate {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		safe = append(safe, canonical)
+	}
+	sort.Strings(safe)
+	return safe
+}
+
+func safeBiometricLogIdentifier(value string) string {
+	canonical, ok := canonicalBiometricIdentifier(value)
+	if !ok {
+		return invalidBiometricMetadata
+	}
+	return canonical
+}
+
+func safeProtocolLogValue(value string) string {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "ATTLOG", "RTLOG", "TABLEDATA", "FINGERTMP", "BIODATA", "BIOPHOTO",
+		"ATTPHOTO", "USER":
+		return strings.ToUpper(strings.TrimSpace(value))
+	default:
+		return "[unknown]"
+	}
+}
+
+func (s *ADMSServer) captureBiometricUploads(sn, table string, body []byte) {
+	canonicalSN, validSN := canonicalBiometricIdentifier(sn)
+	if !validSN {
+		log.Printf("[ADMS] Biometric capture rejected: SN=%s error=invalid device identity",
+			invalidBiometricMetadata)
+		return
+	}
+	sn = canonicalSN
+	protocol, _ := s.agent.devices.protocolState(sn)
+	assets, err := ExtractBiometricAssets(table, body, protocol)
+	if err != nil {
+		log.Printf("[ADMS] Biometric capture rejected: SN=%s table=%s error=%s",
+			sn, table, RedactBiometricText(err.Error()))
+		return
+	}
+
+	rowCount := len(assets)
+	incomingByteCount := len(body)
+	safeKeys := safeBiometricFieldKeys(parseFirstTabKVLine(body))
+	for index := range assets {
+		asset := assets[index]
+		asset.DeviceSN = sn
+		asset.CaptureCommandID = s.biometricCaptureCommandID(asset)
+		job := biometricUploadJob{
+			asset:             asset,
+			metadata:          asset.SafeMetadata(),
+			rowCount:          rowCount,
+			incomingByteCount: incomingByteCount,
+			safeKeys:          append([]string(nil), safeKeys...),
+		}
+		if !s.enqueueBiometricUpload(job) {
+			zeroBytes(asset.Bytes)
+			log.Printf(
+				"[ADMS] Biometric upload queue full: SN=%s PIN=%s TYPE=%d NO=%d",
+				job.metadata.DeviceSN,
+				job.metadata.PIN,
+				job.metadata.BioType,
+				job.metadata.SlotIndex,
+			)
+		}
+	}
+}
+
+func (s *ADMSServer) enqueueBiometricUpload(job biometricUploadJob) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.biometricClosed {
+		return false
+	}
+	if s.biometricUploadQueue == nil {
+		s.biometricUploadQueue = make(chan biometricUploadJob, maxQueuedBiometricUploads)
+	}
+	queue := s.biometricUploadQueue
+	if s.biometricUploadCtx == nil {
+		s.biometricUploadCtx, s.biometricUploadStop = context.WithCancel(context.Background())
+		for range maxConcurrentBiometricUploads {
+			s.biometricWorkers.Add(1)
+			go s.biometricUploadWorker(s.biometricUploadCtx, queue)
+		}
+	}
+	select {
+	case queue <- job:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *ADMSServer) biometricUploadWorker(
+	ctx context.Context,
+	queue <-chan biometricUploadJob,
+) {
+	defer s.biometricWorkers.Done()
+	for {
+		var job biometricUploadJob
+		select {
+		case <-ctx.Done():
+			return
+		case job = <-queue:
+		}
+		if ctx.Err() != nil {
+			zeroBytes(job.asset.Bytes)
+			return
+		}
+		candidateCommandID := job.asset.CaptureCommandID
+		if candidateCommandID != "" &&
+			s.biometricCaptureCommandID(job.asset) != candidateCommandID {
+			job.asset.CaptureCommandID = ""
+		}
+		err := s.agent.UploadBiometricAsset(ctx, job.asset)
+		switch {
+		case err == nil:
+			log.Printf(
+				"[ADMS] Captured biometric vault asset: SN=%s PIN=%s TYPE=%d NO=%d bytes=%d sha256=%s",
+				job.metadata.DeviceSN,
+				job.metadata.PIN,
+				job.metadata.BioType,
+				job.metadata.SlotIndex,
+				job.metadata.ByteCount,
+				job.metadata.SHA256[:12],
+			)
+		case errors.Is(err, ErrBiometricVaultDisabled):
+			s.reportBiometricTemplateUpload(
+				ctx,
+				job.asset.DeviceSN,
+				job.asset.PIN,
+				job.asset.BioType,
+				job.asset.SlotIndex,
+				job.rowCount,
+				job.incomingByteCount,
+				job.safeKeys,
+			)
+		default:
+			log.Printf(
+				"[ADMS] Biometric vault capture failed: SN=%s PIN=%s TYPE=%d NO=%d error=%s",
+				job.asset.DeviceSN,
+				job.asset.PIN,
+				job.asset.BioType,
+				job.asset.SlotIndex,
+				RedactBiometricText(err.Error()),
+			)
+		}
+	}
+}
+
+func (s *ADMSServer) shutdownBiometricUploads() {
+	s.mu.Lock()
+	if !s.biometricClosed {
+		s.biometricClosed = true
+		if s.biometricUploadStop != nil {
+			s.biometricUploadStop()
+		}
+	}
+	s.drainBiometricUploadQueueLocked()
+	s.mu.Unlock()
+
+	s.biometricWorkers.Wait()
+
+	s.mu.Lock()
+	s.drainBiometricUploadQueueLocked()
+	s.mu.Unlock()
+}
+
+func (s *ADMSServer) drainBiometricUploadQueueLocked() {
+	if s.biometricUploadQueue == nil {
+		return
+	}
+	for {
+		select {
+		case job := <-s.biometricUploadQueue:
+			zeroBytes(job.asset.Bytes)
+		default:
+			return
+		}
+	}
+}
+
+func (s *ADMSServer) biometricCaptureCommandID(asset CapturedBiometricAsset) string {
+	key := biometricCaptureKey{
+		DeviceSN: asset.DeviceSN,
+		PIN:      asset.PIN,
+		BioType:  asset.BioType,
+		Slot:     asset.SlotIndex,
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending, ok := s.captureCmd[key]
+	if !ok || time.Since(pending.Recorded) > 10*time.Minute {
+		delete(s.captureCmd, key)
+		return ""
+	}
+	return pending.CloudID
+}
+
+func writeCDataAck(
+	w io.Writer,
+	profile ProtocolProfile,
+	table string,
+	tableName string,
+	accepted int,
+) {
+	if profile == ProtocolTAPush && table != "" && !strings.EqualFold(table, "tabledata") {
+		fmt.Fprintf(w, "OK:%d", accepted)
+		return
+	}
+	if strings.EqualFold(table, "tabledata") && tableName != "" {
+		if strings.EqualFold(tableName, "ATTPHOTO") ||
+			strings.EqualFold(tableName, "user") {
+			fmt.Fprint(w, "OK")
+			return
+		}
+		fmt.Fprintf(w, "%s=%d\n", tableName, accepted)
+		return
+	}
 	fmt.Fprint(w, "OK")
 }
 
@@ -643,38 +1027,15 @@ func countADMSRows(body []byte) int {
 
 func logTableDataPreview(sn, tableName string, body []byte) {
 	fields := parseFirstTabKVLine(body)
-	if len(fields) == 0 {
-		log.Printf("[ADMS] tabledata preview: SN=%s tablename=%s bodyBytes=%d", sn, tableName, len(body))
-		return
-	}
-
-	safe := make([]string, 0, len(fields))
-	for _, key := range []string{"PIN", "Pin", "pin", "UserID", "uid", "type", "Type", "bio_type", "no", "No", "fingerid", "FingerID", "valid", "Valid", "size", "sn"} {
-		value, ok := fields[key]
-		if !ok {
-			continue
-		}
-		if len(value) > 80 {
-			value = value[:80] + "..."
-		}
-		safe = append(safe, fmt.Sprintf("%s=%s", key, value))
-	}
-	if len(safe) == 0 {
-		for key, value := range fields {
-			lower := strings.ToLower(key)
-			if strings.Contains(lower, "photo") || strings.Contains(lower, "template") || strings.Contains(lower, "tmp") || strings.Contains(lower, "bio") {
-				continue
-			}
-			if len(value) > 80 {
-				value = value[:80] + "..."
-			}
-			safe = append(safe, fmt.Sprintf("%s=%s", key, value))
-			if len(safe) >= 6 {
-				break
-			}
-		}
-	}
-	log.Printf("[ADMS] tabledata preview: SN=%s tablename=%s %s", sn, tableName, strings.Join(safe, " "))
+	_ = sn
+	keys := safeBiometricFieldKeys(fields)
+	log.Printf(
+		"[ADMS] tabledata preview: table=%s keys=%s rows=%d bodyBytes=%d",
+		safeProtocolLogValue(tableName),
+		strings.Join(keys, ","),
+		countADMSRows(body),
+		len(body),
+	)
 }
 
 func parseFirstTabKVLine(body []byte) map[string]string {
@@ -686,14 +1047,6 @@ func parseFirstTabKVLine(body []byte) map[string]string {
 		line = line[:i]
 	}
 	return parseTabKV(line)
-}
-
-func fieldKeys(fields map[string]string) []string {
-	keys := make([]string, 0, len(fields))
-	for key := range fields {
-		keys = append(keys, key)
-	}
-	return keys
 }
 
 func firstField(fields map[string]string, keys ...string) string {
@@ -852,7 +1205,9 @@ func (s *ADMSServer) ackFullSync(sn string) {
 // here on every handshake. Returning RegistryCode keeps the device from
 // looping back into the cdata GET indefinitely.
 func (s *ADMSServer) handleRegistry(w http.ResponseWriter, r *http.Request) {
-	s.agent.devices.noteContact(r.URL.Query().Get("SN"), r.RemoteAddr)
+	sn := r.URL.Query().Get("SN")
+	s.agent.devices.noteContact(sn, r.RemoteAddr)
+	s.agent.devices.observeProtocol(sn, ProtocolObservation{Path: r.URL.Path})
 	w.Header().Set("Content-Type", "text/plain")
 	code := strings.ToUpper(strconv.FormatInt(time.Now().Unix(), 16))
 	fmt.Fprintf(w, "RegistryCode=%s", code)
@@ -861,7 +1216,9 @@ func (s *ADMSServer) handleRegistry(w http.ResponseWriter, r *http.Request) {
 // PUSH 3.x devices open this channel for real-time event delivery.
 // Returning push-channel config (not bare OK) prevents reconnect loops.
 func (s *ADMSServer) handlePush(w http.ResponseWriter, r *http.Request) {
-	s.agent.devices.noteContact(r.URL.Query().Get("SN"), r.RemoteAddr)
+	sn := r.URL.Query().Get("SN")
+	s.agent.devices.noteContact(sn, r.RemoteAddr)
+	s.agent.devices.observeProtocol(sn, ProtocolObservation{Path: r.URL.Path})
 	w.Header().Set("Content-Type", "text/plain")
 	fmt.Fprint(w,
 		"ServerVersion=3.1.2\nServerName=ADMS\nPushVersion=3.1.2\n"+
@@ -873,32 +1230,90 @@ func (s *ADMSServer) handlePush(w http.ResponseWriter, r *http.Request) {
 
 func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 	sn := r.URL.Query().Get("SN")
+	logSN := safeBiometricLogIdentifier(sn)
 	s.agent.devices.noteContact(sn, r.RemoteAddr)
-	log.Printf("[ADMS] GET /iclock/getrequest from SN=%s remote=%s query=%s", sn, r.RemoteAddr, r.URL.RawQuery)
+	log.Printf("[ADMS] GET /iclock/getrequest from SN=%s remote=%s",
+		logSN, r.RemoteAddr)
 
 	if sn != "" {
 		if n, err := s.drainCloudCommands(sn); err != nil {
-			log.Printf("[ADMS] Cloud command drain failed for SN=%s: %v", sn, err)
+			log.Printf("[ADMS] Cloud command drain failed for SN=%s: %v", logSN, err)
 		} else if n > 0 {
-			log.Printf("[ADMS] Queued %d cloud command(s) for SN=%s", n, sn)
+			log.Printf("[ADMS] Queued %d cloud command(s) for SN=%s", n, logSN)
 		}
+	}
+
+	command, secretWriterBusy := s.claimSecretCommandWriter(sn)
+	if command != nil {
+		if code := s.queuedSecretCommandCompatibility(command); code != "" {
+			s.failServedSecretCommand(command, code, -1)
+			fmt.Fprint(w, "OK")
+			return
+		}
+		written, writeErr := s.writePendingSecretADMSCommandContext(
+			r.Context(),
+			w,
+			command,
+		)
+		if !written && writeErr == nil {
+			fmt.Fprint(w, "OK")
+		}
+		return
+	}
+	if secretWriterBusy {
+		fmt.Fprint(w, "OK")
+		return
 	}
 
 	s.mu.Lock()
 	queue := s.cmdQueue[sn]
 	if len(queue) == 0 {
 		s.mu.Unlock()
-		log.Printf("[ADMS] No command for SN=%s; responding OK", sn)
+		log.Printf("[ADMS] No command for SN=%s; responding OK", logSN)
 		fmt.Fprint(w, "OK")
 		return
 	}
 	cmd := queue[0]
 	s.cmdQueue[sn] = queue[1:]
-	s.pendingCmd[cmd.ID] = cmd
+	_, deploymentReference := parseBiometricDeploymentReference(cmd.Command)
+	_, deletionReference := parseBiometricDeletionReference(cmd.Command)
+	if (deploymentReference || deletionReference) && cmd.CloudID != "" {
+		delete(s.cloudCmdID, cmd.CloudID)
+	}
 	s.mu.Unlock()
 
+	if s.interceptBiometricDeploymentReference(sn, cmd) {
+		fmt.Fprint(w, "OK")
+		return
+	}
+
+	protocol, _ := s.agent.devices.protocolState(sn)
+	decision := RenderDeviceCommand(protocol, cmd.Command)
+	if decision.Action == CommandRefused {
+		s.mu.Lock()
+		if cmd.CloudID != "" {
+			delete(s.cloudCmdID, cmd.CloudID)
+		}
+		s.mu.Unlock()
+		log.Printf("[ADMS] Refused command for SN=%s localID=%d cloudID=%s reason=%q",
+			sn, cmd.ID, cmd.CloudID, decision.Reason)
+		if cmd.CloudID != "" {
+			go s.reportCloudCommandResult(cmd.CloudID, -2, decision.Reason)
+		}
+		fmt.Fprint(w, "OK")
+		return
+	}
+
+	s.mu.Lock()
+	s.pendingCmd[pendingCommandKey{DeviceSN: sn, LocalID: cmd.ID}] = cmd
+	s.rememberBiometricCaptureCommandLocked(sn, cmd)
+	s.mu.Unlock()
+	if decision.Action == CommandTranslated {
+		log.Printf("[ADMS] Translated command for SN=%s localID=%d cloudID=%s reason=%q",
+			sn, cmd.ID, cmd.CloudID, decision.Reason)
+	}
 	log.Printf("[ADMS] Serving command to SN=%s localID=%d cloudID=%s label=%q", sn, cmd.ID, cmd.CloudID, cmd.Label)
-	fmt.Fprintf(w, "C:%d:%s", cmd.ID, cmd.Command)
+	fmt.Fprintf(w, "C:%d:%s", cmd.ID, decision.Rendered)
 }
 
 func (s *ADMSServer) enqueueCommand(sn, command string) int {
@@ -929,6 +1344,57 @@ func (s *ADMSServer) enqueueADMSCommand(sn, command, cloudID, label string) int 
 	return id
 }
 
+func (s *ADMSServer) rememberBiometricCaptureCommandLocked(sn string, cmd ADMSCommand) {
+	if !isBiometricCaptureCommandID(cmd.CloudID) {
+		return
+	}
+	name, fields := parseDeviceCommand(cmd.Command)
+	if name != "ENROLL_BIO" && name != "ENROLL_FP" {
+		return
+	}
+	pin := fields["PIN"]
+	bioType, validType := strictCommandInt(fields, "TYPE", 1, 9)
+	slot, validSlot := strictCommandInt(fields, "NO", 0, 9)
+	if name == "ENROLL_FP" {
+		bioType, validType = 1, true
+		slot, validSlot = strictCommandInt(fields, "FID", 0, 9)
+	}
+	if pin == "" || !validType || !validSlot || (bioType != 1 && bioType != 9) {
+		return
+	}
+	if s.captureCmd == nil {
+		s.captureCmd = make(map[biometricCaptureKey]pendingBiometricCapture)
+	}
+	s.captureCmd[biometricCaptureKey{
+		DeviceSN: sn,
+		PIN:      pin,
+		BioType:  bioType,
+		Slot:     slot,
+	}] = pendingBiometricCapture{
+		CloudID:  cmd.CloudID,
+		Recorded: time.Now(),
+	}
+}
+
+func strictCommandInt(
+	fields map[string]string,
+	key string,
+	minimum int,
+	maximum int,
+) (int, bool) {
+	raw, present := fields[key]
+	value, err := strconv.Atoi(strings.TrimSpace(raw))
+	return value, present && err == nil && value >= minimum && value <= maximum
+}
+
+func (s *ADMSServer) forgetBiometricCaptureCommandLocked(cloudID string) {
+	for key, capture := range s.captureCmd {
+		if capture.CloudID == cloudID {
+			delete(s.captureCmd, key)
+		}
+	}
+}
+
 func (s *ADMSServer) drainCloudCommands(sn string) (int, error) {
 	commandsURL := fmt.Sprintf("%s/api/agent-bridge/commands?deviceSn=%s&limit=10", s.agent.config.PlamatixURL, url.QueryEscape(sn))
 	req, err := http.NewRequest(http.MethodGet, commandsURL, nil)
@@ -945,8 +1411,8 @@ func (s *ADMSServer) drainCloudCommands(sn string) (int, error) {
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(res.Body)
-		return 0, fmt.Errorf("HTTP %d: %s", res.StatusCode, string(respBody))
+		_, _ = io.Copy(io.Discard, res.Body)
+		return 0, fmt.Errorf("HTTP %d", res.StatusCode)
 	}
 
 	var payload cloudCommandsResponse
@@ -956,6 +1422,13 @@ func (s *ADMSServer) drainCloudCommands(sn string) (int, error) {
 
 	for _, cmd := range payload.Commands {
 		if strings.TrimSpace(cmd.ID) == "" || strings.TrimSpace(cmd.Cmd) == "" {
+			continue
+		}
+		if s.interceptBiometricDeploymentReference(sn, ADMSCommand{
+			Command: cmd.Cmd,
+			CloudID: cmd.ID,
+			Label:   cmd.Label,
+		}) {
 			continue
 		}
 		id := s.enqueueADMSCommand(sn, cmd.Cmd, cmd.ID, cmd.Label)
@@ -970,37 +1443,94 @@ func (s *ADMSServer) drainCloudCommands(sn string) (int, error) {
 
 func (s *ADMSServer) handleDeviceCmd(w http.ResponseWriter, r *http.Request) {
 	sn := r.URL.Query().Get("SN")
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(io.LimitReader(
+		r.Body,
+		maxDeviceCommandACKBodyBytes+1,
+	))
 	if err != nil {
+		zeroBytes(body)
 		log.Printf("[ADMS] Error reading devicecmd body: %v", err)
 		fmt.Fprint(w, "OK")
 		return
 	}
+	defer zeroBytes(body)
+	if s.routeDeviceCommandACK(sn, body) == deviceCommandACKSecret {
+		_, _ = s.handleSecretDeviceCommandACK(sn, body)
+		fmt.Fprint(w, "OK")
+		return
+	}
+	if len(body) > maxDeviceCommandACKBodyBytes {
+		fmt.Fprint(w, "OK")
+		return
+	}
 
-	params, _ := url.ParseQuery(string(body))
-	log.Printf("[ADMS] Device command result: SN=%s ID=%s Return=%s CMD=%s",
-		sn, params.Get("ID"), params.Get("Return"), params.Get("CMD"))
+	params, parseErr := url.ParseQuery(string(body))
+	localID, validID := strictDeviceCommandInteger(
+		params,
+		"ID",
+		1,
+		int(^uint32(0)>>1),
+		parseErr,
+	)
+	returnCode, validReturn := strictDeviceCommandReturn(params, parseErr)
+	idLog, returnLog := invalidBiometricMetadata, invalidBiometricMetadata
+	if validID {
+		idLog = strconv.Itoa(localID)
+	}
+	if validReturn {
+		returnLog = strconv.Itoa(returnCode)
+	}
+	log.Printf("[ADMS] Device command result: SN=%s ID=%s Return=%s",
+		safeBiometricLogIdentifier(sn), idLog, returnLog)
 
-	localID, err := strconv.Atoi(strings.TrimSpace(params.Get("ID")))
-	if err == nil {
+	if validID {
+		if !validReturn {
+			returnCode = -1
+		}
+		key := pendingCommandKey{DeviceSN: sn, LocalID: localID}
 		s.mu.Lock()
-		cmd, ok := s.pendingCmd[localID]
+		cmd, ok := s.pendingCmd[key]
 		if ok {
-			delete(s.pendingCmd, localID)
+			delete(s.pendingCmd, key)
 			if cmd.CloudID != "" {
 				delete(s.cloudCmdID, cmd.CloudID)
+			}
+			if !validReturn || returnCode != 0 {
+				s.forgetBiometricCaptureCommandLocked(cmd.CloudID)
 			}
 		}
 		s.mu.Unlock()
 
 		if ok && cmd.CloudID != "" {
-			returnCode := atoiOrZero(params.Get("Return"))
-			resultBody := strings.TrimSpace(string(body))
+			resultBody := fmt.Sprintf("ID=%d&Return=%d", localID, returnCode)
 			go s.reportCloudCommandResult(cmd.CloudID, returnCode, resultBody)
 		}
 	}
 
 	fmt.Fprint(w, "OK")
+}
+
+func strictDeviceCommandReturn(params url.Values, parseErr error) (int, bool) {
+	return strictDeviceCommandInteger(params, "Return", -1_000_000, 1_000_000, parseErr)
+}
+
+func strictDeviceCommandInteger(
+	params url.Values,
+	key string,
+	minimum,
+	maximum int,
+	parseErr error,
+) (int, bool) {
+	values, present := params[key]
+	if parseErr != nil || !present || len(values) != 1 {
+		return 0, false
+	}
+	raw := strings.TrimSpace(values[0])
+	if raw == "" {
+		return 0, false
+	}
+	value, err := strconv.Atoi(raw)
+	return value, err == nil && value >= minimum && value <= maximum
 }
 
 func (s *ADMSServer) reportCloudCommandResult(cloudID string, returnCode int, resultBody string) {
@@ -1033,23 +1563,50 @@ func (s *ADMSServer) reportCloudCommandResult(cloudID string, returnCode int, re
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(res.Body)
-		log.Printf("[ADMS] Post command result failed (HTTP %d): %s", res.StatusCode, string(respBody))
+		_, _ = io.Copy(io.Discard, res.Body)
+		log.Printf("[ADMS] Post command result failed (HTTP %d)", res.StatusCode)
 		return
 	}
 
-	log.Printf("[ADMS] Reported cloud command result: cloudID=%s Return=%d", cloudID, returnCode)
+	log.Printf("[ADMS] Reported cloud command result: Return=%d", returnCode)
 }
 
-func (s *ADMSServer) reportBiometricTemplateUpload(sn, pin string, bioType, templateNo, rowCount, byteCount int, keys []string) {
+func (s *ADMSServer) reportBiometricTemplateUpload(
+	ctx context.Context,
+	sn,
+	pin string,
+	bioType,
+	templateNo,
+	rowCount,
+	byteCount int,
+	keys []string,
+) {
+	canonicalSN, validSN := canonicalBiometricIdentifier(sn)
+	canonicalPIN, validPIN := canonicalBiometricIdentifier(pin)
+	safeKeys := safeBiometricFieldKeys(func() map[string]string {
+		fields := make(map[string]string, len(keys))
+		for _, key := range keys {
+			fields[key] = ""
+		}
+		return fields
+	}())
+	if !validSN || !validPIN ||
+		(bioType != 1 && bioType != 9) ||
+		templateNo < 0 || templateNo > 9 ||
+		rowCount < 1 || rowCount > maxBiometricAssetsPerRequest ||
+		byteCount < 1 || byteCount > maxBiometricCDataBodyBytes ||
+		len(safeKeys) != len(keys) {
+		log.Printf("[ADMS] Biometric template fallback rejected: invalid metadata")
+		return
+	}
 	payload := map[string]any{
-		"deviceSn":   sn,
-		"pin":        pin,
+		"deviceSn":   canonicalSN,
+		"pin":        canonicalPIN,
 		"bioType":    bioType,
 		"templateNo": templateNo,
 		"rowCount":   rowCount,
 		"byteCount":  byteCount,
-		"fieldKeys":  keys,
+		"fieldKeys":  safeKeys,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -1058,7 +1615,12 @@ func (s *ADMSServer) reportBiometricTemplateUpload(sn, pin string, bioType, temp
 	}
 
 	uploadURL := fmt.Sprintf("%s/api/agent-bridge/biometric-template", s.agent.config.PlamatixURL)
-	req, err := http.NewRequest(http.MethodPost, uploadURL, strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		uploadURL,
+		strings.NewReader(string(body)),
+	)
 	if err != nil {
 		log.Printf("[ADMS] Create biometric template upload request error: %v", err)
 		return
@@ -1075,13 +1637,13 @@ func (s *ADMSServer) reportBiometricTemplateUpload(sn, pin string, bioType, temp
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(res.Body)
-		log.Printf("[ADMS] Post biometric template upload failed (HTTP %d): %s", res.StatusCode, string(respBody))
+		_, _ = io.Copy(io.Discard, res.Body)
+		log.Printf("[ADMS] Post biometric template upload failed (HTTP %d)", res.StatusCode)
 		return
 	}
 
 	log.Printf("[ADMS] Reported biometric template upload: SN=%s PIN=%s TYPE=%d NO=%d rows=%d bytes=%d",
-		sn, pin, bioType, templateNo, rowCount, byteCount)
+		canonicalSN, canonicalPIN, bioType, templateNo, rowCount, byteCount)
 }
 
 func (s *ADMSServer) handlePing(w http.ResponseWriter, r *http.Request) {
@@ -1113,28 +1675,60 @@ func (s *ADMSServer) reflectBioData(sn string, body []byte) {
 		line = strings.TrimSpace(line[:i])
 	}
 
-	fields := parseTabKV(line)
-	pin := firstField(fields, "Pin", "PIN", "pin")
-	no := firstField(fields, "No", "NO", "no")
-	bioType := firstField(fields, "Type", "TYPE", "type")
-	tmp := firstField(fields, "Tmp", "TMP", "tmp")
-	if pin == "" || bioType == "" || tmp == "" {
-		log.Printf("[ADMS] reflectBioData skipped: SN=%s missing Pin/Type/Tmp in upload", sn)
+	canonicalSN, validSN := canonicalBiometricIdentifier(sn)
+	parsed := parseBiometricFields(line)
+	pin, pinPresent, uniquePIN := uniqueBiometricField(parsed, "pin", "userid", "uid")
+	tmp, tmpPresent, uniqueTemplate := uniqueBiometricField(parsed, "tmp", "template")
+	bioTypeValue, typeErr := requiredBiometricInt(parsed, 1, 9, "type")
+	if !validSN || !pinPresent || !uniquePIN || !tmpPresent || !uniqueTemplate ||
+		typeErr != nil || (bioTypeValue != 1 && bioTypeValue != 9) {
+		log.Printf("[ADMS] reflectBioData skipped: SN=%s missing Pin/Type/Tmp in upload",
+			safeBiometricLogIdentifier(sn))
 		return
 	}
-	if no == "" {
-		no = "0"
+	pin, validPIN := canonicalBiometricIdentifier(pin)
+	if !validPIN {
+		log.Printf("[ADMS] reflectBioData skipped: SN=%s invalid identity metadata",
+			safeBiometricLogIdentifier(sn))
+		return
 	}
+	slot := 0
+	if len(parsed.occurrences["no"]) > 0 || len(parsed.occurrences["index"]) > 0 {
+		var slotErr error
+		slot, slotErr = requiredBiometricInt(parsed, 0, 9, "no", "index")
+		if slotErr != nil {
+			log.Printf("[ADMS] reflectBioData skipped: SN=%s invalid numeric metadata",
+				safeBiometricLogIdentifier(sn))
+			return
+		}
+	}
+	limit := maxFaceTemplateBytes
+	if bioTypeValue == 1 {
+		limit = maxFingerprintTemplateBytes
+	}
+	decoded, decodeErr := decodeBoundedBiometric(tmp, limit)
+	if decodeErr != nil {
+		log.Printf("[ADMS] reflectBioData skipped: SN=%s invalid template encoding",
+			safeBiometricLogIdentifier(sn))
+		return
+	}
+	zeroBytes(decoded)
+
+	fields := parseTabKV(line)
+	no := strconv.Itoa(slot)
+	bioType := strconv.Itoa(bioTypeValue)
 
 	cmd, label := buildBioWriteCmd(pin, no, bioType, tmp, fields)
 	if cmd == "" {
-		log.Printf("[ADMS] reflectBioData skipped: SN=%s unsupported Type=%s", sn, bioType)
+		log.Printf("[ADMS] reflectBioData skipped: SN=%s unsupported Type=%s",
+			safeBiometricLogIdentifier(sn), invalidBiometricMetadata)
 		return
 	}
 
-	id := s.enqueueADMSCommand(sn, cmd, "", label)
+	id := s.enqueueADMSCommand(canonicalSN, cmd, "", label)
 	log.Printf("[ADMS] Reflected BioData to SN=%s as cmd localID=%d (cmdLen=%d, tmpLen=%d, type=%s, uploadFields=%s)",
-		sn, id, len(cmd), len(tmp), bioType, strings.Join(fieldKeys(fields), ","))
+		safeBiometricLogIdentifier(sn), id, len(cmd), len(tmp), bioType,
+		strings.Join(safeBiometricFieldKeys(fields), ","))
 }
 
 // buildBioWriteCmd dispatches per bio type to the device-friendly verb.
@@ -1154,10 +1748,10 @@ func buildBioWriteCmd(pin, no, bioType, tmp string, fields map[string]string) (s
 		size := decodedTemplateSize(tmp)
 		cmd := fmt.Sprintf("DATA UPDATE FINGERTMP PIN=%s\tFID=%s\tSize=%d\tValid=1\tTMP=%s",
 			pin, no, size, tmp)
-		return cmd, fmt.Sprintf("reflect fingertmp pin=%s fid=%s", pin, no)
+		return cmd, "reflect fingertmp"
 	}
 	return buildCanonicalBioData(pin, no, bioType, tmp, fields),
-		fmt.Sprintf("reflect biodata pin=%s no=%s type=%s", pin, no, bioType)
+		"reflect biodata"
 }
 
 func buildCanonicalBioData(pin, no, bioType, tmp string, fields map[string]string) string {
@@ -1244,13 +1838,20 @@ func (s *ADMSServer) handleQueryData(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Printf("[ADMS] querydata read error: SN=%s cmdid=%s err=%v", sn, cmdidStr, err)
+		log.Printf("[ADMS] querydata read error: SN=%s cmdid=%s err=%v",
+			safeBiometricLogIdentifier(sn), invalidBiometricMetadata, err)
 		writeQueryDataAck(w, cmdidStr)
 		return
 	}
 
+	cmdIDLog := invalidBiometricMetadata
+	if parsedID, parseErr := strconv.Atoi(strings.TrimSpace(cmdidStr)); parseErr == nil &&
+		parsedID > 0 && parsedID <= int(^uint32(0)>>1) {
+		cmdIDLog = strconv.Itoa(parsedID)
+	}
 	log.Printf("[ADMS] POST /iclock/querydata SN=%s cmdid=%s type=%s tablename=%s pack=%d/%d bytes=%d",
-		sn, cmdidStr, queryType, tableName, packIdx, packCnt, len(body))
+		safeBiometricLogIdentifier(sn), cmdIDLog, safeProtocolLogValue(queryType),
+		safeProtocolLogValue(tableName), packIdx, packCnt, len(body))
 
 	finalPack := packIdx >= packCnt
 	var aggregated []byte
@@ -1271,9 +1872,10 @@ func (s *ADMSServer) handleQueryData(w http.ResponseWriter, r *http.Request) {
 	if finalPack {
 		if localID, parseErr := strconv.Atoi(strings.TrimSpace(cmdidStr)); parseErr == nil {
 			s.mu.Lock()
-			cmd, ok := s.pendingCmd[localID]
+			key := pendingCommandKey{DeviceSN: sn, LocalID: localID}
+			cmd, ok := s.pendingCmd[key]
 			if ok {
-				delete(s.pendingCmd, localID)
+				delete(s.pendingCmd, key)
 				if cmd.CloudID != "" {
 					delete(s.cloudCmdID, cmd.CloudID)
 				}
@@ -1281,12 +1883,28 @@ func (s *ADMSServer) handleQueryData(w http.ResponseWriter, r *http.Request) {
 			s.mu.Unlock()
 
 			if ok && cmd.CloudID != "" {
-				go s.reportCloudCommandResult(cmd.CloudID, 0, string(aggregated))
+				resultBody := trustedQueryResultBody(cmd.Command, aggregated)
+				go s.reportCloudCommandResult(
+					cmd.CloudID,
+					0,
+					resultBody,
+				)
 			}
 		}
 	}
 
 	writeQueryDataAck(w, cmdidStr)
+}
+
+func trustedQueryResultBody(command string, body []byte) string {
+	switch command {
+	case "DATA QUERY ATTLOG", "DATA QUERY USERINFO":
+		return RedactBiometricText(string(body))
+	case "DATA QUERY FINGERTMP", "DATA QUERY BIODATA", "DATA QUERY BIOPHOTO":
+		return "[REDACTED:BIOMETRIC_QUERY_RESULT]"
+	default:
+		return "[REDACTED:BIOMETRIC_QUERY_RESULT]"
+	}
 }
 
 // ZK iClock Proxy firmwares expect "OK: <cmdid>" so the device can mark the
@@ -1305,8 +1923,8 @@ func writeQueryDataAck(w http.ResponseWriter, cmdid string) {
 // hammering a 404 retry loop and starving /iclock/getrequest.
 func (s *ADMSServer) handleICLockFallback(w http.ResponseWriter, r *http.Request) {
 	s.agent.devices.noteContact(r.URL.Query().Get("SN"), r.RemoteAddr)
-	log.Printf("[ADMS] Unhandled %s %s from %s query=%s",
-		r.Method, r.URL.Path, r.RemoteAddr, r.URL.RawQuery)
+	log.Printf("[ADMS] Unhandled %s %s from %s",
+		r.Method, r.URL.Path, r.RemoteAddr)
 	w.Header().Set("Content-Type", "text/plain")
 	fmt.Fprint(w, "OK")
 }
@@ -1433,6 +2051,48 @@ func (a *Agent) handleCommand(requestId, command string, params map[string]strin
 		}
 	case "zkbiotime_request":
 		result, cmdErr = a.cmdZkbiotimeRequest(ctx, params)
+	case "migration_preflight":
+		if a.config.MigrationDSN == "" {
+			cmdErr = fmt.Errorf("migration_dsn is not configured locally")
+		} else {
+			result, cmdErr = NewZKBioTimePostgresSource(
+				a.config.MigrationDSN,
+			).Preflight(ctx)
+		}
+	case "migration_inventory":
+		if a.config.MigrationDSN == "" {
+			cmdErr = fmt.Errorf("migration_dsn is not configured locally")
+		} else {
+			result, cmdErr = NewZKBioTimePostgresSource(
+				a.config.MigrationDSN,
+			).Inventory(ctx)
+		}
+	case "migration_read_batch":
+		if a.config.MigrationDSN == "" {
+			cmdErr = fmt.Errorf("migration_dsn is not configured locally")
+		} else {
+			afterID, parseErr := strconv.ParseInt(params["afterId"], 10, 64)
+			if params["afterId"] == "" {
+				afterID = 0
+				parseErr = nil
+			}
+			limit := atoiOrZero(params["limit"])
+			if limit == 0 {
+				limit = 500
+			}
+			if parseErr != nil {
+				cmdErr = fmt.Errorf("invalid afterId")
+			} else {
+				result, cmdErr = NewZKBioTimePostgresSource(
+					a.config.MigrationDSN,
+				).ReadBatch(
+					ctx,
+					EntityType(params["entity"]),
+					BatchCursor{AfterID: afterID},
+					limit,
+				)
+			}
+		}
 	case "wake_device":
 		if a.adms == nil {
 			cmdErr = fmt.Errorf("ADMS server not running")

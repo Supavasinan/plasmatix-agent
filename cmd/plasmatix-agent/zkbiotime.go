@@ -61,7 +61,25 @@ func newZKBioTimeClientWith(baseURL, username, password string, hc *http.Client)
 
 // do delegates to the SDK's Raw escape hatch: an authenticated request returning
 // the status code and the undecoded body (a non-2xx status is not an error).
+//
+// A body that isn't JSON *is* an error, whatever the status. BioTime serves its
+// fault page with HTTP 200 when the application is down, so without this check
+// reads fail with an unattributable "invalid character '<'" and writes — which
+// only ever inspect the status code — report work that never happened.
 func (c *ZKBioTimeClient) do(ctx context.Context, method, path string, query url.Values, payload any) (int, []byte, error) {
+	code, body, err := c.doPassthrough(ctx, method, path, query, payload)
+	if err != nil {
+		return code, body, err
+	}
+	if err := zk.VerifyJSONBody(code, body, method, path); err != nil {
+		return code, body, err
+	}
+	return code, body, nil
+}
+
+// doPassthrough is do without the JSON check, for the API explorer: showing the
+// operator whatever BioTime actually returned is the whole point of that page.
+func (c *ZKBioTimeClient) doPassthrough(ctx context.Context, method, path string, query url.Values, payload any) (int, []byte, error) {
 	return c.sdk.Raw(ctx, method, path, query, payload)
 }
 
@@ -463,7 +481,7 @@ func (a *Agent) cmdZkbiotimeRequest(ctx context.Context, params map[string]strin
 			return nil, fmt.Errorf("body must be valid JSON: %w", err)
 		}
 	}
-	code, respBody, err := c.do(ctx, method, path, q, body)
+	code, respBody, err := c.doPassthrough(ctx, method, path, q, body)
 	if err != nil {
 		return nil, err
 	}

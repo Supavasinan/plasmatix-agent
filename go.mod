@@ -3,7 +3,7 @@ module github.com/Supavasinan/plasmatix-agent
 go 1.25.0
 
 require (
-	github.com/Supavasinan/zkbiotime-go v0.1.4
+	github.com/Supavasinan/zkbiotime-go v0.1.5
 	github.com/jackc/pgx/v5 v5.7.6
 	golang.org/x/sys v0.47.0
 )

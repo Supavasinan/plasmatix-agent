@@ -498,44 +498,83 @@ func (a *Agent) cmdZkbiotimeRequest(ctx context.Context, params map[string]strin
 // acknowledged by the bridge. The cursor only advances after the bridge accepts
 // each batch, so delayed punches and retries cannot create permanent gaps.
 func (a *Agent) runZKBioTimePollLoop(ctx context.Context) {
-	c := a.zkbiotime
-	if c == nil {
+	p := a.newZKBioTimePoller()
+	if p == nil {
 		return
 	}
 	const interval = 60 * time.Second
 
-	var cursor int64
-	cursorLoaded := false
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	pull := func() {
-		if !cursorLoaded {
-			lastTransactionID, err := a.fetchZKBioTimeLastTransactionID(ctx)
-			if err != nil {
-				log.Printf("[zkbiotime] fetch transaction cursor: %v", err)
-				return
-			}
-			cursor = lastTransactionID
-			cursorLoaded = true
-		}
-
-		nextCursor, err := a.catchUpZKBioTimeTransactions(ctx, c, cursor)
-		if err != nil {
-			log.Printf("[zkbiotime] catch up transactions: %v", err)
-			return
-		}
-		cursor = nextCursor
-	}
-
-	pull()
+	p.pollOnce(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			pull()
+			p.pollOnce(ctx)
 		}
+	}
+}
+
+// pollErrorRemindInterval is how often a still-unresolved failure reports in.
+// At the loop's 60s cadence this turns ~1,440 identical lines a day into 48.
+const pollErrorRemindInterval = 30 * time.Minute
+
+// zkbiotimePoller holds one poll loop's state: the durable cursor, its position
+// in the catch-up, and the dampener that keeps a sustained outage from filling
+// the log ring.
+type zkbiotimePoller struct {
+	agent  *Agent
+	client *ZKBioTimeClient
+
+	cursor       int64
+	cursorLoaded bool
+	failures     *errorDampener
+}
+
+// newZKBioTimePoller returns nil when the agent is not in zkbiotime mode.
+func (a *Agent) newZKBioTimePoller() *zkbiotimePoller {
+	if a.zkbiotime == nil {
+		return nil
+	}
+	return &zkbiotimePoller{
+		agent:    a,
+		client:   a.zkbiotime,
+		failures: newErrorDampener(pollErrorRemindInterval),
+	}
+}
+
+// pollOnce runs a single catch-up pass. Both failure paths share one dampener:
+// only one of them runs per pass, and switching between them is a change of
+// state worth logging.
+func (p *zkbiotimePoller) pollOnce(ctx context.Context) {
+	if !p.cursorLoaded {
+		lastTransactionID, err := p.agent.fetchZKBioTimeLastTransactionID(ctx)
+		if err != nil {
+			p.logFailure("fetch transaction cursor", err)
+			return
+		}
+		p.cursor = lastTransactionID
+		p.cursorLoaded = true
+	}
+
+	nextCursor, err := p.agent.catchUpZKBioTimeTransactions(ctx, p.client, p.cursor)
+	if err != nil {
+		p.logFailure("catch up transactions", err)
+		return
+	}
+	p.cursor = nextCursor
+
+	if line := p.failures.recovered(); line != "" {
+		log.Printf("[zkbiotime] %s", line)
+	}
+}
+
+func (p *zkbiotimePoller) logFailure(what string, err error) {
+	if line := p.failures.fail(fmt.Errorf("%s: %w", what, err)); line != "" {
+		log.Printf("[zkbiotime] %s", line)
 	}
 }
 

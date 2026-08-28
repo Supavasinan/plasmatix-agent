@@ -43,6 +43,16 @@ type Config struct {
 	Port          int
 	Mode          string
 	ADMSPort      int
+	// DeviceTimeZone is the UTC offset in whole hours pushed to scanners in the
+	// handshake. ZKBioTime owns this today; once the agent drives a device on
+	// its own, a wrong value silently shifts every punch it records.
+	DeviceTimeZone int
+	// StampStyle selects the handshake's upload-pointer key names: "legacy"
+	// emits ATTLOGStamp/OPERLOGStamp/ATTPHOTOStamp, "push3" emits ZKBioTime's
+	// Stamp/OpStamp/PhotoStamp. Firmware that ignores the spelling it does not
+	// expect will replay its entire backlog every handshake, so this is a
+	// per-site setting to validate against real hardware, not a guess.
+	StampStyle string
 }
 
 type Agent struct {
@@ -327,6 +337,8 @@ func main() {
 			// Active TCP probe is only useful when the agent has device IPs to
 			// probe — those come from incoming ADMS requests.
 			go agent.runProbeLoop(context.Background())
+			// Without ZKBioTime present nothing else owns the scanners' clocks.
+			go agent.runClockSyncLoop(context.Background())
 		}
 		if cfg.Mode == "zkbiotime" {
 			// Pull ZKBioTime transactions periodically and relay them to /attlog.
@@ -401,6 +413,15 @@ func loadConfig(path string) (Config, error) {
 		port = parsedPort
 	}
 
+	deviceTimeZone := defaultDeviceTimeZone
+	if parsed["device_timezone"] != "" {
+		parsedTimeZone, err := strconv.Atoi(parsed["device_timezone"])
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid device_timezone: %w", err)
+		}
+		deviceTimeZone = parsedTimeZone
+	}
+
 	admsPort := 0
 	if parsed["adms_port"] != "" {
 		parsedADMSPort, err := strconv.Atoi(parsed["adms_port"])
@@ -420,6 +441,9 @@ func loadConfig(path string) (Config, error) {
 		Port:          port,
 		Mode:          parsed["mode"],
 		ADMSPort:      admsPort,
+
+		DeviceTimeZone: deviceTimeZone,
+		StampStyle:     parsed["stamp_style"],
 	})
 }
 
@@ -439,6 +463,24 @@ func normalizeConfig(cfg Config) (Config, error) {
 	}
 	if cfg.ADMSPort == 0 {
 		cfg.ADMSPort = 8081
+	}
+	cfg.StampStyle = strings.ToLower(strings.TrimSpace(cfg.StampStyle))
+	if cfg.StampStyle == "" {
+		cfg.StampStyle = stampStyleLegacy
+	}
+	if cfg.StampStyle != stampStyleLegacy && cfg.StampStyle != stampStylePush3 {
+		return Config{}, fmt.Errorf(
+			"invalid stamp_style %q: must be %q or %q",
+			cfg.StampStyle, stampStyleLegacy, stampStylePush3,
+		)
+	}
+	// ZKTeco encodes the offset in whole hours; UTC-12..UTC+14 covers every
+	// real zone. Rejecting the rest stops a typo from shifting punches.
+	if cfg.DeviceTimeZone < -12 || cfg.DeviceTimeZone > 14 {
+		return Config{}, fmt.Errorf(
+			"invalid device_timezone %d: must be between -12 and 14",
+			cfg.DeviceTimeZone,
+		)
 	}
 
 	if cfg.Mode != "zkbio" && cfg.Mode != "adms" && cfg.Mode != "zkbiotime" {
@@ -571,7 +613,11 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 			stamp = "0"
 		}
 
-		fmt.Fprint(w, buildHandshakeOptions(sn, stamp))
+		fmt.Fprint(w, buildHandshakeOptions(
+			sn, stamp,
+			s.agent.config.StampStyle,
+			s.agent.config.DeviceTimeZone,
+		))
 
 		if fullSync {
 			go s.ackFullSync(sn)
@@ -1244,7 +1290,8 @@ func (s *ADMSServer) handlePush(w http.ResponseWriter, r *http.Request) {
 		"ServerVersion=3.1.2\nServerName=ADMS\nPushVersion=3.1.2\n"+
 			"ErrorDelay=30\nRequestDelay=10\nTransInterval=1\n"+
 			"TransTables=User Transaction Facev7 templatev10\n"+
-			"TimeZone=7\nRealTime=1\nTimeoutSec=30",
+			fmt.Sprintf("TimeZone=%d\n", s.agent.config.DeviceTimeZone)+
+			"RealTime=1\nTimeoutSec=30",
 	)
 }
 

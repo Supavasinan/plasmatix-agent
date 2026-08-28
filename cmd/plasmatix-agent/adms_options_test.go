@@ -102,7 +102,7 @@ func TestScalarVersionFallbackWhenMultiBioAbsent(t *testing.T) {
 }
 
 func TestHandshakeRequestsCapabilitiesAndUsesTabbedTransFlag(t *testing.T) {
-	resp := buildHandshakeOptions("NYU7253100765", "9999")
+	resp := buildHandshakeOptions("NYU7253100765", "9999", stampStyleLegacy, 7)
 
 	// Without PushOptionsFlag + PushOptions the device never sends its options
 	// block, and every biometric delivery stays blocked on unknown algorithms.
@@ -140,7 +140,7 @@ func TestHandshakeRequestsCapabilitiesAndUsesTabbedTransFlag(t *testing.T) {
 }
 
 func TestHandshakeFullSyncStampReplaysBacklog(t *testing.T) {
-	if !strings.Contains(buildHandshakeOptions("SN1", "0"), "ATTLOGStamp=0") {
+	if !strings.Contains(buildHandshakeOptions("SN1", "0", stampStyleLegacy, 7), "ATTLOGStamp=0") {
 		t.Error("full-sync handshake must carry stamp 0 so the device replays")
 	}
 }
@@ -216,5 +216,60 @@ func TestRealDeviceHandshakeUnlocksBiometricGate(t *testing.T) {
 		if got := state.Capabilities[key]; got != want {
 			t.Errorf("capabilities[%q] = %q, want %q", key, got, want)
 		}
+	}
+}
+
+func TestHandshakeStampStyleSelectsKeySpelling(t *testing.T) {
+	legacy := buildHandshakeOptions("SN1", "9999", stampStyleLegacy, 7)
+	if !strings.Contains(legacy, "ATTLOGStamp=9999") {
+		t.Errorf("legacy style must emit ATTLOGStamp, got:\n%s", legacy)
+	}
+	if strings.Contains(legacy, "\nStamp=") {
+		t.Error("legacy style must not emit the push3 Stamp key")
+	}
+
+	push3 := buildHandshakeOptions("SN1", "9999", stampStylePush3, 7)
+	for _, want := range []string{"Stamp=9999", "OpStamp=9999", "PhotoStamp=None"} {
+		if !strings.Contains(push3, want) {
+			t.Errorf("push3 style missing %q, got:\n%s", want, push3)
+		}
+	}
+	if strings.Contains(push3, "ATTLOGStamp") {
+		t.Error("push3 style must not emit the legacy ATTLOGStamp key")
+	}
+}
+
+func TestHandshakeCarriesConfiguredTimeZone(t *testing.T) {
+	// A hardcoded offset silently shifts every punch on any site that is not
+	// UTC+7 — the exact failure that cost this deployment a day of records.
+	for offset, want := range map[int]string{7: "TimeZone=7", 0: "TimeZone=0", -5: "TimeZone=-5"} {
+		got := buildHandshakeOptions("SN1", "9999", stampStyleLegacy, offset)
+		if !strings.Contains(got, want) {
+			t.Errorf("offset %d: handshake missing %q", offset, want)
+		}
+	}
+}
+
+func TestNormalizeConfigValidatesDeviceSettings(t *testing.T) {
+	base := Config{APIKey: "k", PlamatixURL: "https://example.test", Mode: "adms"}
+
+	cfg, err := normalizeConfig(base)
+	if err != nil {
+		t.Fatalf("defaults rejected: %v", err)
+	}
+	if cfg.StampStyle != stampStyleLegacy {
+		t.Errorf("default stamp style = %q, want %q", cfg.StampStyle, stampStyleLegacy)
+	}
+
+	withZone := base
+	withZone.DeviceTimeZone = 99
+	if _, err := normalizeConfig(withZone); err == nil {
+		t.Error("device_timezone 99 must be rejected")
+	}
+
+	withStyle := base
+	withStyle.StampStyle = "guess"
+	if _, err := normalizeConfig(withStyle); err == nil {
+		t.Error("unknown stamp_style must be rejected")
 	}
 }

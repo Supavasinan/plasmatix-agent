@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strconv"
 	"strings"
 )
 
@@ -187,22 +188,27 @@ const pushOptionsRequest = "UserCount,TransactionCount,FingerFunOn,FPVersion," +
 const transFlagTokens = "TransData AttLog\tOpLog\tAttPhoto\tEnrollFP\t" +
 	"EnrollUser\tFPImag\tChgUser\tChgFP\tFACE\tUserPic\tFVEIN\tBioPhoto"
 
+// Upload-pointer key spellings. ZKBioTime speaks push3 to this hardware; the
+// agent's own production history proves legacy works. Which one a given
+// firmware honours has to be observed, not assumed — see Config.StampStyle.
+const (
+	stampStyleLegacy = "legacy"
+	stampStylePush3  = "push3"
+)
+
+// defaultDeviceTimeZone matches the site the agent was built for (UTC+7).
+const defaultDeviceTimeZone = 7
+
 // buildHandshakeOptions renders the GET /iclock/cdata handshake response.
 //
 // The field set mirrors ZKBioTime's reply to the same device, since that is the
-// only configuration this hardware is known to accept. Two deliberate
-// differences:
-//
-//   - The legacy ATTLOGStamp/OPERLOGStamp/ATTPHOTOStamp keys are kept rather
-//     than switched to ZKBioTime's Push 3.x Stamp/OpStamp/PhotoStamp spelling.
-//     The legacy names are proven against this firmware by the agent's own
-//     production history; renaming them is unvalidated and a wrong stamp key
-//     makes the device replay its entire backlog on every handshake.
-//
-//   - TimeZone is fixed at 7. ZKBioTime pushes the operator-configured offset
-//     here and a wrong value silently shifts every punch, so this must become
-//     configurable before the agent drives a device on its own.
-func buildHandshakeOptions(sn, stamp string) string {
+// only configuration this hardware is known to accept.
+func buildHandshakeOptions(sn, stamp, stampStyle string, timeZone int) string {
+	attKey, opKey, photoKey := "ATTLOGStamp", "OPERLOGStamp", "ATTPHOTOStamp"
+	if stampStyle == stampStylePush3 {
+		attKey, opKey, photoKey = "Stamp", "OpStamp", "PhotoStamp"
+	}
+
 	lines := []string{
 		"GET OPTION FROM: " + sn,
 		"TransFlag=" + transFlagTokens,
@@ -214,10 +220,10 @@ func buildHandshakeOptions(sn, stamp string) string {
 		"PushOptionsFlag=1",
 		"MaxPostSize=1048576",
 		"PushOptions=" + pushOptionsRequest,
-		"ATTLOGStamp=" + stamp,
-		"OPERLOGStamp=" + stamp,
-		"ATTPHOTOStamp=None",
-		"TimeZone=7",
+		attKey + "=" + stamp,
+		opKey + "=" + stamp,
+		photoKey + "=None",
+		"TimeZone=" + strconv.Itoa(timeZone),
 		"TransTimes=00:00;14:05",
 		"TransInterval=1",
 		"ErrorDelay=60",

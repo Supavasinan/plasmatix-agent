@@ -571,11 +571,7 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 			stamp = "0"
 		}
 
-		resp := fmt.Sprintf(
-			"GET OPTION FROM: %s\nATTLOGStamp=%s\nOPERLOGStamp=%s\nATTPHOTOStamp=None\nErrorDelay=30\nDelay=10\nTransTimes=00:00;14:05\nTransInterval=1\nTransFlag=TransData AttLog OpLog AttPhoto EnrollUser ChgUser EnrollFP ChgFP UserPic\nTimeZone=7\nRealtime=1\nEncrypt=None",
-			sn, stamp, stamp,
-		)
-		fmt.Fprint(w, resp)
+		fmt.Fprint(w, buildHandshakeOptions(sn, stamp))
 
 		if fullSync {
 			go s.ackFullSync(sn)
@@ -700,6 +696,30 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 			if strings.EqualFold(table, "BIODATA") {
 				s.reflectBioData(sn, body)
 			}
+
+		case "options":
+			// The device answers the handshake's PushOptions request here. This
+			// is the only message that states its algorithm versions and which
+			// biometric record types it accepts, so without it the cloud can
+			// never clear the compatibility gate and no template is deliverable.
+			deviceOptions := parseDeviceOptions(body)
+			if capabilities := capabilitiesFromOptions(deviceOptions); capabilities != nil {
+				// Path stays /iclock/cdata and PushVersion is empty on this POST,
+				// so the profile scored at handshake time is preserved and only
+				// the capability map is merged in.
+				s.agent.devices.observeProtocol(sn, ProtocolObservation{
+					Path:         r.URL.Path,
+					Capabilities: capabilities,
+				})
+			}
+			log.Printf("[ADMS] Received device options from SN=%s (%d keys)",
+				safeBiometricLogIdentifier(sn), len(deviceOptions))
+			// Options are acked with a bare OK. The count-style "OK:n" ack that
+			// ta_push uses for data tables makes the firmware re-send the whole
+			// option block on every handshake (same failure as tablename=user,
+			// see b78b468).
+			fmt.Fprint(w, "OK")
+			return
 
 		default:
 			log.Printf("[ADMS] Received table=%s from SN=%s (%d bytes)",

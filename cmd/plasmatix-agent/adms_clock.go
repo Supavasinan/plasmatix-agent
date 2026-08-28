@@ -41,9 +41,21 @@ func decodeZKDateTime(value int64, loc *time.Location) time.Time {
 }
 
 // deviceClockSyncCommand renders the ADMS command that sets a scanner's clock.
+//
+// The verb is SET OPTIONS, plural. ZKBioTime's own bytecode uses
+// "SET OPTIONS DateTime=%s" in both core/zkcmdproc (SyncACTime) and
+// iclock/comm/utils, while reserving the singular "SET OPTION" for other
+// device settings. Sending the singular form here is silently ignored by the
+// firmware — the command is acked and the clock never moves.
+//
+// The value is ZKTeco's packed date integer (see encodeZKDateTime). That
+// encoding is the long-standing ZK convention but is the one part of this
+// command not confirmed from ZKBioTime's bytecode, since the value is computed
+// rather than stored as a literal. Verify against a device before relying on
+// it unattended: queue one command and read the clock back.
 func deviceClockSyncCommand(now time.Time, timeZone int) string {
 	local := now.In(deviceLocation(timeZone))
-	return fmt.Sprintf("SET OPTION DateTime=%d", encodeZKDateTime(local))
+	return fmt.Sprintf("SET OPTIONS DateTime=%d", encodeZKDateTime(local))
 }
 
 // deviceLocation builds the fixed-offset zone the scanner runs in. ZKTeco

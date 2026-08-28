@@ -37,7 +37,7 @@ func TestClockSyncCommandUsesDeviceTimeZone(t *testing.T) {
 	instant := time.Date(2026, 8, 28, 11, 45, 0, 0, time.UTC)
 
 	command := deviceClockSyncCommand(instant, 7)
-	if !strings.HasPrefix(command, "SET OPTION DateTime=") {
+	if !strings.HasPrefix(command, "SET OPTIONS DateTime=") {
 		t.Fatalf("unexpected command %q", command)
 	}
 
@@ -75,7 +75,7 @@ func TestSyncDeviceClocksQueuesPerDevice(t *testing.T) {
 		if len(queue) != 1 {
 			t.Fatalf("SN=%s queued %d commands, want 1", sn, len(queue))
 		}
-		if !strings.HasPrefix(queue[0].Command, "SET OPTION DateTime=") {
+		if !strings.HasPrefix(queue[0].Command, "SET OPTIONS DateTime=") {
 			t.Errorf("SN=%s queued %q", sn, queue[0].Command)
 		}
 	}

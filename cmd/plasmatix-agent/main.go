@@ -1110,6 +1110,26 @@ func (s *ADMSServer) biometricCaptureCommandID(asset CapturedBiometricAsset) str
 	return ""
 }
 
+// answersImportQuery reports whether a template upload is the device reading
+// back what it already holds for an import, rather than a new enrolment. An
+// enrolment command for the same slot wins: that upload is new and still needs
+// the write-back.
+func (s *ADMSServer) answersImportQuery(sn, pin string, bioType, slot int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	capture, enrolling := s.captureCmd[biometricCaptureKey{
+		DeviceSN: sn,
+		PIN:      pin,
+		BioType:  bioType,
+		Slot:     slot,
+	}]
+	if enrolling && time.Since(capture.Recorded) <= 10*time.Minute {
+		return false
+	}
+	query, ok := s.importQuery[importQueryKey{DeviceSN: sn, PIN: pin}]
+	return ok && time.Since(query.Recorded) <= 10*time.Minute
+}
+
 func writeCDataAck(
 	w io.Writer,
 	profile ProtocolProfile,
@@ -1878,13 +1898,20 @@ func (s *ADMSServer) reflectBioData(sn string, body []byte) {
 	}
 	slot := 0
 	if len(parsed.occurrences["no"]) > 0 || len(parsed.occurrences["index"]) > 0 {
+		// Real rows carry both No (the finger) and Index (the part); read them
+		// the way capture does, or every enrolment skips the write-back.
 		var slotErr error
-		slot, slotErr = requiredBiometricInt(parsed, 0, 9, "no", "index")
+		slot, slotErr = biometricSlot(parsed)
 		if slotErr != nil {
 			log.Printf("[ADMS] reflectBioData skipped: SN=%s invalid numeric metadata",
 				safeBiometricLogIdentifier(sn))
 			return
 		}
+	}
+	if s.answersImportQuery(canonicalSN, pin, bioTypeValue, slot) {
+		log.Printf("[ADMS] reflectBioData skipped: SN=%s reply to an import query",
+			safeBiometricLogIdentifier(sn))
+		return
 	}
 	limit := maxFaceTemplateBytes
 	if bioTypeValue == 1 {

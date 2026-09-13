@@ -244,3 +244,68 @@ func TestImportQueryResultStaysRedacted(t *testing.T) {
 		t.Fatalf("query result leaked template bytes: %q", got)
 	}
 }
+
+func queuedCommands(server *ADMSServer, sn string) []string {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	commands := make([]string, 0, len(server.cmdQueue[sn]))
+	for _, cmd := range server.cmdQueue[sn] {
+		commands = append(commands, cmd.Command)
+	}
+	return commands
+}
+
+// A finger enrolled on this firmware uploads with both No (the finger) and
+// Index (the part). The write-back that makes the device commit the template
+// read that as duplicated metadata and skipped every real row.
+func TestEnrolmentUploadWithNoAndIndexIsWrittenBack(t *testing.T) {
+	server, _, done := newImportTestServer(t)
+	defer done()
+
+	server.reflectBioData("NYU1", []byte(fingerprintRow("14", "3")))
+
+	commands := queuedCommands(server, "NYU1")
+	if len(commands) != 1 || !strings.HasPrefix(commands[0], "DATA UPDATE FINGERTMP PIN=14\tFID=3\t") {
+		t.Fatalf("write-back = %q; want one DATA UPDATE FINGERTMP for PIN=14 FID=3", commands)
+	}
+}
+
+// A reply to an import query is the device reading back what it already
+// holds. Writing it back would rewrite every imported template for nothing.
+func TestImportQueryReplyIsNotWrittenBackToTheDevice(t *testing.T) {
+	server, uploads, done := newImportTestServer(t)
+	defer done()
+	serveImportQuery(server, 1, "8", importQueryLabel)
+
+	server.handleCData(
+		httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodPost, "/iclock/cdata?SN=NYU1&table=tabledata&tablename=BIODATA", strings.NewReader(fingerprintRow("8", "5"))),
+	)
+
+	expectUploads(t, uploads, 1)
+	if commands := queuedCommands(server, "NYU1"); len(commands) != 0 {
+		t.Fatalf("import reply was written back to the device: %q", commands)
+	}
+}
+
+// An enrolment for the same person inside an import's window is still an
+// enrolment, and still needs the write-back.
+func TestEnrolmentDuringAnImportIsStillWrittenBack(t *testing.T) {
+	server, _, done := newImportTestServer(t)
+	defer done()
+	serveImportQuery(server, 1, "8", importQueryLabel)
+	server.mu.Lock()
+	server.rememberBiometricCaptureCommandLocked("NYU1", ADMSCommand{
+		ID:      2,
+		Command: "ENROLL_BIO TYPE=1\tNO=6\tPIN=8\tRETRY=0\tOVERWRITE=1",
+		CloudID: "55555555-5555-4555-8555-555555555555",
+	})
+	server.mu.Unlock()
+
+	server.reflectBioData("NYU1", []byte(fingerprintRow("8", "6")))
+
+	commands := queuedCommands(server, "NYU1")
+	if len(commands) != 1 || !strings.HasPrefix(commands[0], "DATA UPDATE FINGERTMP PIN=8\tFID=6\t") {
+		t.Fatalf("write-back = %q; want one DATA UPDATE FINGERTMP for PIN=8 FID=6", commands)
+	}
+}

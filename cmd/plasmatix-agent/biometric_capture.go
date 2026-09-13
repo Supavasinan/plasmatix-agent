@@ -193,7 +193,7 @@ func extractBiometricAsset(
 		if bioType != 1 && bioType != 9 {
 			return CapturedBiometricAsset{}, false, errors.New("unsupported biometric type")
 		}
-		slot, err = requiredBiometricInt(fields, 0, 9, "no", "index")
+		slot, err = biometricSlot(fields)
 		if err != nil {
 			return CapturedBiometricAsset{}, false, err
 		}
@@ -211,7 +211,7 @@ func extractBiometricAsset(
 		}
 	case "BIOPHOTO":
 		var err error
-		slot, err = requiredBiometricInt(fields, 0, 9, "no", "index")
+		slot, err = biometricSlot(fields)
 		if err != nil {
 			return CapturedBiometricAsset{}, false, err
 		}
@@ -287,6 +287,38 @@ func biometricField(fields biometricFields, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// biometricSlot reads which slot a template row belongs to.
+//
+// A real row carries both No and Index — ZKBioTime's iclock_biodata for a
+// SenseFace 2A on ZKFinger 13.0 stores bio_no 0,3,5,6,7,8,9 with bio_index 0
+// throughout. No is the finger (or face) slot; Index is the part within that
+// slot, for algorithms that split one biometric across several templates.
+// These used to be read as two spellings of the slot, which rejected every
+// real row as duplicated — live enrolment captures included.
+//
+// Index alone keeps its old meaning as the slot. A non-zero part is refused by
+// name: the vault holds one template per slot, and storing part one would
+// silently replace part zero.
+func biometricSlot(fields biometricFields) (int, error) {
+	if len(fields.occurrences["no"]) == 0 {
+		return requiredBiometricInt(fields, 0, 9, "index")
+	}
+	slot, err := requiredBiometricInt(fields, 0, 9, "no")
+	if err != nil {
+		return 0, err
+	}
+	if len(fields.occurrences["index"]) > 0 {
+		part, partErr := requiredBiometricInt(fields, 0, 99, "index")
+		if partErr != nil {
+			return 0, partErr
+		}
+		if part != 0 {
+			return 0, errors.New("multi-part biometric template is not supported")
+		}
+	}
+	return slot, nil
 }
 
 func requiredBiometricInt(

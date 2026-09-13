@@ -714,3 +714,44 @@ func TestUploadBiometricAssetNeverReturnsArbitraryResponseBody(t *testing.T) {
 		t.Fatalf("upload error returned arbitrary response body: %s", err)
 	}
 }
+
+// The row shape a real scanner sends. ZKBioTime's iclock_biodata for a
+// SenseFace 2A on ZKFinger 13.0 stores bio_no 0,3,5,6,7,8,9 with bio_index 0
+// on every row: No is the finger, Index is the part within it. The parser
+// used to read No and Index as two spellings of the slot and reject every
+// real row as "duplicated".
+func TestExtractBiometricAssetsReadsNoAsSlotAndIndexAsPart(t *testing.T) {
+	row := "Pin=8\tNo=6\tIndex=0\tValid=1\tDuress=0\tType=1\tMajorVer=13\tMinorVer=0\tFormat=0\tTmp=QUJDRA=="
+	assets, err := ExtractBiometricAssets("BIODATA", []byte(row), DeviceProtocolState{})
+	if err != nil {
+		t.Fatalf("real ZKTeco BIODATA row rejected: %v", err)
+	}
+	if len(assets) != 1 || assets[0].SlotIndex != 6 || assets[0].PIN != "8" || assets[0].BioType != 1 {
+		t.Fatalf("assets = %+v; want PIN 8 finger slot 6", assets)
+	}
+}
+
+// A second part of the same slot cannot be stored in a one-template-per-slot
+// vault. Refuse it by name rather than let it overwrite part zero.
+func TestExtractBiometricAssetsRefusesAMultiPartTemplate(t *testing.T) {
+	row := "Pin=8\tNo=0\tIndex=1\tType=9\tMajorVer=40\tMinorVer=1\tTmp=QUJDRA=="
+	if _, err := ExtractBiometricAssets("BIODATA", []byte(row), DeviceProtocolState{}); err == nil ||
+		!strings.Contains(err.Error(), "multi-part") {
+		t.Fatalf("err = %v; want a multi-part refusal", err)
+	}
+}
+
+func TestExtractBiometricAssetsStillReadsIndexAloneAsTheSlot(t *testing.T) {
+	row := "Pin=8\tIndex=4\tType=1\tTmp=QUJDRA=="
+	assets, err := ExtractBiometricAssets("BIODATA", []byte(row), DeviceProtocolState{})
+	if err != nil || len(assets) != 1 || assets[0].SlotIndex != 4 {
+		t.Fatalf("assets = %+v err = %v; want slot 4", assets, err)
+	}
+}
+
+func TestExtractBiometricAssetsStillRejectsARepeatedSlot(t *testing.T) {
+	row := "Pin=8\tNo=1\tNo=2\tType=1\tTmp=QUJDRA=="
+	if _, err := ExtractBiometricAssets("BIODATA", []byte(row), DeviceProtocolState{}); err == nil {
+		t.Fatal("a row naming two slots was accepted")
+	}
+}

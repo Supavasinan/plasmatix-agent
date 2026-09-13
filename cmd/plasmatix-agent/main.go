@@ -192,6 +192,7 @@ type ADMSServer struct {
 	cloudCmdID               map[string]struct{}
 	queryBuffers             map[string][]byte
 	captureCmd               map[biometricCaptureKey]pendingBiometricCapture
+	importQuery              map[importQueryKey]pendingBiometricCapture
 	biometricUploadQueue     chan biometricUploadJob
 	biometricUploadCtx       context.Context
 	biometricUploadStop      context.CancelFunc
@@ -237,6 +238,22 @@ type pendingBiometricCapture struct {
 	CloudID  string
 	Recorded time.Time
 }
+
+// importQueryKey identifies a "DATA QUERY USERINFO PIN=x" the import served to
+// a device. Unlike an enrolment, the reply carries every finger and face the
+// person holds, so the slot and type are not known in advance — the key is the
+// device and the person, and that binding is what stops a reply from carrying
+// anyone else's template into the vault.
+type importQueryKey struct {
+	DeviceSN string
+	PIN      string
+}
+
+// biometricImportLabelPrefix marks the queries Plasmatix issues to import the
+// templates already on a scanner. The server enforces the same label; checking
+// it here too keeps plaintext templates from being sent for a query that the
+// vault would refuse anyway.
+const biometricImportLabelPrefix = "biometric-import:"
 
 type biometricUploadJob struct {
 	asset             CapturedBiometricAsset
@@ -888,7 +905,27 @@ func safeProtocolLogValue(value string) string {
 	}
 }
 
+func isBiometricTemplateTable(tableName string) bool {
+	switch strings.ToUpper(strings.TrimSpace(tableName)) {
+	case "BIODATA", "FINGERTMP", "BIOPHOTO":
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *ADMSServer) captureBiometricUploads(sn, table string, body []byte) {
+	s.captureBiometricAssets(sn, table, body, false)
+}
+
+// captureTaggedBiometricUploads captures only the assets a served command
+// authorises. Used for query replies, where an untagged row has no business
+// leaving the agent.
+func (s *ADMSServer) captureTaggedBiometricUploads(sn, table string, body []byte) {
+	s.captureBiometricAssets(sn, table, body, true)
+}
+
+func (s *ADMSServer) captureBiometricAssets(sn, table string, body []byte, requireCommand bool) {
 	canonicalSN, validSN := canonicalBiometricIdentifier(sn)
 	if !validSN {
 		log.Printf("[ADMS] Biometric capture rejected: SN=%s error=invalid device identity",
@@ -911,6 +948,10 @@ func (s *ADMSServer) captureBiometricUploads(sn, table string, body []byte) {
 		asset := assets[index]
 		asset.DeviceSN = sn
 		asset.CaptureCommandID = s.biometricCaptureCommandID(asset)
+		if requireCommand && asset.CaptureCommandID == "" {
+			zeroBytes(asset.Bytes)
+			continue
+		}
 		job := biometricUploadJob{
 			asset:             asset,
 			metadata:          asset.SafeMetadata(),
@@ -1055,11 +1096,18 @@ func (s *ADMSServer) biometricCaptureCommandID(asset CapturedBiometricAsset) str
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pending, ok := s.captureCmd[key]
-	if !ok || time.Since(pending.Recorded) > 10*time.Minute {
-		delete(s.captureCmd, key)
-		return ""
+	if ok && time.Since(pending.Recorded) <= 10*time.Minute {
+		return pending.CloudID
 	}
-	return pending.CloudID
+	delete(s.captureCmd, key)
+
+	queryKey := importQueryKey{DeviceSN: asset.DeviceSN, PIN: asset.PIN}
+	query, ok := s.importQuery[queryKey]
+	if ok && time.Since(query.Recorded) <= 10*time.Minute {
+		return query.CloudID
+	}
+	delete(s.importQuery, queryKey)
+	return ""
 }
 
 func writeCDataAck(
@@ -1454,6 +1502,10 @@ func (s *ADMSServer) rememberBiometricCaptureCommandLocked(sn string, cmd ADMSCo
 		return
 	}
 	name, fields := parseDeviceCommand(cmd.Command)
+	if name == "DATA QUERY USERINFO" {
+		s.rememberImportQueryLocked(sn, cmd, fields)
+		return
+	}
 	if name != "ENROLL_BIO" && name != "ENROLL_FP" {
 		return
 	}
@@ -1481,6 +1533,28 @@ func (s *ADMSServer) rememberBiometricCaptureCommandLocked(sn string, cmd ADMSCo
 	}
 }
 
+func (s *ADMSServer) rememberImportQueryLocked(
+	sn string,
+	cmd ADMSCommand,
+	fields map[string]string,
+) {
+	if !strings.HasPrefix(cmd.Label, biometricImportLabelPrefix) ||
+		len(cmd.Label) == len(biometricImportLabelPrefix) {
+		return
+	}
+	pin, validPIN := canonicalBiometricIdentifier(fields["PIN"])
+	if !validPIN {
+		return
+	}
+	if s.importQuery == nil {
+		s.importQuery = make(map[importQueryKey]pendingBiometricCapture)
+	}
+	s.importQuery[importQueryKey{DeviceSN: sn, PIN: pin}] = pendingBiometricCapture{
+		CloudID:  cmd.CloudID,
+		Recorded: time.Now(),
+	}
+}
+
 func strictCommandInt(
 	fields map[string]string,
 	key string,
@@ -1496,6 +1570,11 @@ func (s *ADMSServer) forgetBiometricCaptureCommandLocked(cloudID string) {
 	for key, capture := range s.captureCmd {
 		if capture.CloudID == cloudID {
 			delete(s.captureCmd, key)
+		}
+	}
+	for key, query := range s.importQuery {
+		if query.CloudID == cloudID {
+			delete(s.importQuery, key)
 		}
 	}
 }
@@ -1962,7 +2041,10 @@ func (s *ADMSServer) handleQueryData(w http.ResponseWriter, r *http.Request) {
 	var aggregated []byte
 
 	if cmdidStr != "" && packCnt > 1 {
-		key := fmt.Sprintf("%s|%s", sn, cmdidStr)
+		// Keyed by table as well: a device answering a person's query can send
+		// the user record and the template table under one cmdid, and mixing
+		// their packs would corrupt both.
+		key := fmt.Sprintf("%s|%s|%s", sn, cmdidStr, strings.ToUpper(tableName))
 		s.mu.Lock()
 		s.queryBuffers[key] = append(s.queryBuffers[key], body...)
 		if finalPack {
@@ -1972,6 +2054,13 @@ func (s *ADMSServer) handleQueryData(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 	} else if finalPack {
 		aggregated = body
+	}
+
+	if finalPack && isBiometricTemplateTable(tableName) {
+		// Only templates tagged with a query this import served are sent on;
+		// anything else in a query reply is dropped here rather than uploaded
+		// for the vault to refuse.
+		s.captureTaggedBiometricUploads(sn, strings.ToUpper(strings.TrimSpace(tableName)), aggregated)
 	}
 
 	if finalPack {

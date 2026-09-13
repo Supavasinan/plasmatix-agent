@@ -48,14 +48,32 @@ func decodeZKDateTime(value int64, loc *time.Location) time.Time {
 // device settings. Sending the singular form here is silently ignored by the
 // firmware — the command is acked and the clock never moves.
 //
-// The value is ZKTeco's packed date integer (see encodeZKDateTime). That
-// encoding is the long-standing ZK convention but is the one part of this
-// command not confirmed from ZKBioTime's bytecode, since the value is computed
-// rather than stored as a literal. Verify against a device before relying on
-// it unattended: queue one command and read the clock back.
+// The value is ZKTeco's packed date integer (see encodeZKDateTime), confirmed
+// by disassembling ZKBioTime 8's own utils.pyc: its encodeTime(y, m, d, hour,
+// min, sec) computes (((y-2000)*12*31 + (m-1)*31 + d-1) * 86400) +
+// (hour*60 + min)*60 + sec, which is this formula term for term.
 func deviceClockSyncCommand(now time.Time, timeZone int) string {
 	local := now.In(deviceLocation(timeZone))
 	return fmt.Sprintf("SET OPTIONS DateTime=%d", encodeZKDateTime(local))
+}
+
+// deviceClockSyncTemplate is what sits in the queue. The time is filled in
+// when the device collects the command, not when it is queued.
+//
+// ZKBioTime does the same: SyncACTime in core/zkcmdproc.pyc saves the literal
+// "SET OPTIONS DateTime=%s" with no formatting step. Queue-time values go stale
+// whenever a scanner is offline across a tick — rebooting, or a network blip —
+// and the device then collects a clock up to an hour behind and runs that slow
+// until the next tick.
+const deviceClockSyncTemplate = "SET OPTIONS DateTime=%s"
+
+// fillClockCommand replaces a queued clock template with the current time in
+// the device's zone. Any other command passes through untouched.
+func fillClockCommand(command string, now time.Time, timeZone int) string {
+	if command != deviceClockSyncTemplate {
+		return command
+	}
+	return deviceClockSyncCommand(now, timeZone)
 }
 
 // deviceLocation builds the fixed-offset zone the scanner runs in. ZKTeco
@@ -96,13 +114,17 @@ func (a *Agent) syncDeviceClocks(now time.Time) {
 	if a.adms == nil || a.devices == nil {
 		return
 	}
-	command := deviceClockSyncCommand(now, a.config.DeviceTimeZone)
 	for _, device := range a.devices.snapshot() {
 		if device.SN == "" {
 			continue
 		}
-		a.adms.enqueueCommand(device.SN, command)
-		log.Printf("[ADMS] Queued clock sync for SN=%s (%s)",
+		// One pending clock-set per device, as ZKBioTime does. Without this a
+		// scanner offline for five hours collected five on return, each
+		// rewinding it, queued ahead of any real command.
+		if _, queued := a.adms.enqueueCommandUnlessPending(device.SN, deviceClockSyncTemplate); !queued {
+			continue
+		}
+		log.Printf("[ADMS] Queued clock sync for SN=%s (tick %s; time set on collection)",
 			safeBiometricLogIdentifier(device.SN),
 			now.In(deviceLocation(a.config.DeviceTimeZone)).Format(time.RFC3339),
 		)

@@ -1360,6 +1360,9 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	cmd := queue[0]
 	s.cmdQueue[sn] = queue[1:]
+	// A clock-set is stored as a template; its time is decided now, at
+	// collection, so it is never older than this request.
+	cmd.Command = fillClockCommand(cmd.Command, time.Now(), s.agent.config.DeviceTimeZone)
 	_, deploymentReference := parseBiometricDeploymentReference(cmd.Command)
 	_, deletionReference := parseBiometricDeletionReference(cmd.Command)
 	if (deploymentReference || deletionReference) && cmd.CloudID != "" {
@@ -1403,6 +1406,23 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 
 func (s *ADMSServer) enqueueCommand(sn, command string) int {
 	return s.enqueueADMSCommand(sn, command, "", "")
+}
+
+// enqueueCommandUnlessPending queues command only if an identical one is not
+// already waiting for this device. The check and the append share the lock, so
+// two ticks racing cannot both queue.
+func (s *ADMSServer) enqueueCommandUnlessPending(sn, command string) (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, queued := range s.cmdQueue[sn] {
+		if queued.Command == command {
+			return queued.ID, false
+		}
+	}
+	s.cmdID++
+	id := s.cmdID
+	s.cmdQueue[sn] = append(s.cmdQueue[sn], ADMSCommand{ID: id, Command: command})
+	return id, true
 }
 
 func (s *ADMSServer) enqueueADMSCommand(sn, command, cloudID, label string) int {

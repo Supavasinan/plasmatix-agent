@@ -369,10 +369,25 @@ func loadConfig(path string) (Config, error) {
 		Port          int    `json:"port"`
 		Mode          string `json:"mode"`
 		ADMSPort      int    `json:"adms_port"`
+		// A pointer, because absent and zero mean different things: absent
+		// takes the site default, while 0 is a real UTC+0 site. A plain int
+		// cannot tell them apart.
+		DeviceTimeZone *int   `json:"device_timezone"`
+		StampStyle     string `json:"stamp_style"`
 	}
 
 	var jc jsonConfig
 	if json.Unmarshal(raw, &jc) == nil && jc.APIKey != "" {
+		// This branch used to omit DeviceTimeZone, leaving it at Go's zero
+		// value. normalizeConfig accepts 0 as valid UTC, so every JSON config —
+		// which is every config Plasmatix's installer writes — ran scanners on
+		// UTC: the first clock sync after switching to ADMS mode set a Bangkok
+		// device seven hours slow, and every punch after it landed seven hours
+		// early. The key:value branch below always defaulted correctly.
+		deviceTimeZone := defaultDeviceTimeZone
+		if jc.DeviceTimeZone != nil {
+			deviceTimeZone = *jc.DeviceTimeZone
+		}
 		return normalizeConfig(Config{
 			APIKey:        jc.APIKey,
 			PlamatixURL:   jc.PlamatixURL,
@@ -383,6 +398,9 @@ func loadConfig(path string) (Config, error) {
 			Port:          jc.Port,
 			Mode:          jc.Mode,
 			ADMSPort:      jc.ADMSPort,
+
+			DeviceTimeZone: deviceTimeZone,
+			StampStyle:     jc.StampStyle,
 		})
 	}
 

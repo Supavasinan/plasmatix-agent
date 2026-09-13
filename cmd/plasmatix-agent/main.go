@@ -43,6 +43,16 @@ type Config struct {
 	Port          int
 	Mode          string
 	ADMSPort      int
+	// DeviceTimeZone is the UTC offset in whole hours pushed to scanners in the
+	// handshake. ZKBioTime owns this today; once the agent drives a device on
+	// its own, a wrong value silently shifts every punch it records.
+	DeviceTimeZone int
+	// StampStyle selects the handshake's upload-pointer key names: "legacy"
+	// emits ATTLOGStamp/OPERLOGStamp/ATTPHOTOStamp, "push3" emits ZKBioTime's
+	// Stamp/OpStamp/PhotoStamp. Firmware that ignores the spelling it does not
+	// expect will replay its entire backlog every handshake, so this is a
+	// per-site setting to validate against real hardware, not a guess.
+	StampStyle string
 }
 
 type Agent struct {
@@ -327,6 +337,8 @@ func main() {
 			// Active TCP probe is only useful when the agent has device IPs to
 			// probe — those come from incoming ADMS requests.
 			go agent.runProbeLoop(context.Background())
+			// Without ZKBioTime present nothing else owns the scanners' clocks.
+			go agent.runClockSyncLoop(context.Background())
 		}
 		if cfg.Mode == "zkbiotime" {
 			// Pull ZKBioTime transactions periodically and relay them to /attlog.
@@ -357,10 +369,25 @@ func loadConfig(path string) (Config, error) {
 		Port          int    `json:"port"`
 		Mode          string `json:"mode"`
 		ADMSPort      int    `json:"adms_port"`
+		// A pointer, because absent and zero mean different things: absent
+		// takes the site default, while 0 is a real UTC+0 site. A plain int
+		// cannot tell them apart.
+		DeviceTimeZone *int   `json:"device_timezone"`
+		StampStyle     string `json:"stamp_style"`
 	}
 
 	var jc jsonConfig
 	if json.Unmarshal(raw, &jc) == nil && jc.APIKey != "" {
+		// This branch used to omit DeviceTimeZone, leaving it at Go's zero
+		// value. normalizeConfig accepts 0 as valid UTC, so every JSON config —
+		// which is every config Plasmatix's installer writes — ran scanners on
+		// UTC: the first clock sync after switching to ADMS mode set a Bangkok
+		// device seven hours slow, and every punch after it landed seven hours
+		// early. The key:value branch below always defaulted correctly.
+		deviceTimeZone := defaultDeviceTimeZone
+		if jc.DeviceTimeZone != nil {
+			deviceTimeZone = *jc.DeviceTimeZone
+		}
 		return normalizeConfig(Config{
 			APIKey:        jc.APIKey,
 			PlamatixURL:   jc.PlamatixURL,
@@ -371,6 +398,9 @@ func loadConfig(path string) (Config, error) {
 			Port:          jc.Port,
 			Mode:          jc.Mode,
 			ADMSPort:      jc.ADMSPort,
+
+			DeviceTimeZone: deviceTimeZone,
+			StampStyle:     jc.StampStyle,
 		})
 	}
 
@@ -401,6 +431,15 @@ func loadConfig(path string) (Config, error) {
 		port = parsedPort
 	}
 
+	deviceTimeZone := defaultDeviceTimeZone
+	if parsed["device_timezone"] != "" {
+		parsedTimeZone, err := strconv.Atoi(parsed["device_timezone"])
+		if err != nil {
+			return Config{}, fmt.Errorf("invalid device_timezone: %w", err)
+		}
+		deviceTimeZone = parsedTimeZone
+	}
+
 	admsPort := 0
 	if parsed["adms_port"] != "" {
 		parsedADMSPort, err := strconv.Atoi(parsed["adms_port"])
@@ -420,6 +459,9 @@ func loadConfig(path string) (Config, error) {
 		Port:          port,
 		Mode:          parsed["mode"],
 		ADMSPort:      admsPort,
+
+		DeviceTimeZone: deviceTimeZone,
+		StampStyle:     parsed["stamp_style"],
 	})
 }
 
@@ -439,6 +481,24 @@ func normalizeConfig(cfg Config) (Config, error) {
 	}
 	if cfg.ADMSPort == 0 {
 		cfg.ADMSPort = 8081
+	}
+	cfg.StampStyle = strings.ToLower(strings.TrimSpace(cfg.StampStyle))
+	if cfg.StampStyle == "" {
+		cfg.StampStyle = stampStyleLegacy
+	}
+	if cfg.StampStyle != stampStyleLegacy && cfg.StampStyle != stampStylePush3 {
+		return Config{}, fmt.Errorf(
+			"invalid stamp_style %q: must be %q or %q",
+			cfg.StampStyle, stampStyleLegacy, stampStylePush3,
+		)
+	}
+	// ZKTeco encodes the offset in whole hours; UTC-12..UTC+14 covers every
+	// real zone. Rejecting the rest stops a typo from shifting punches.
+	if cfg.DeviceTimeZone < -12 || cfg.DeviceTimeZone > 14 {
+		return Config{}, fmt.Errorf(
+			"invalid device_timezone %d: must be between -12 and 14",
+			cfg.DeviceTimeZone,
+		)
 	}
 
 	if cfg.Mode != "zkbio" && cfg.Mode != "adms" && cfg.Mode != "zkbiotime" {
@@ -571,11 +631,11 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 			stamp = "0"
 		}
 
-		resp := fmt.Sprintf(
-			"GET OPTION FROM: %s\nATTLOGStamp=%s\nOPERLOGStamp=%s\nATTPHOTOStamp=None\nErrorDelay=30\nDelay=10\nTransTimes=00:00;14:05\nTransInterval=1\nTransFlag=TransData AttLog OpLog AttPhoto EnrollUser ChgUser EnrollFP ChgFP UserPic\nTimeZone=7\nRealtime=1\nEncrypt=None",
-			sn, stamp, stamp,
-		)
-		fmt.Fprint(w, resp)
+		fmt.Fprint(w, buildHandshakeOptions(
+			sn, stamp,
+			s.agent.config.StampStyle,
+			s.agent.config.DeviceTimeZone,
+		))
 
 		if fullSync {
 			go s.ackFullSync(sn)
@@ -700,6 +760,30 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 			if strings.EqualFold(table, "BIODATA") {
 				s.reflectBioData(sn, body)
 			}
+
+		case "options":
+			// The device answers the handshake's PushOptions request here. This
+			// is the only message that states its algorithm versions and which
+			// biometric record types it accepts, so without it the cloud can
+			// never clear the compatibility gate and no template is deliverable.
+			deviceOptions := parseDeviceOptions(body)
+			if capabilities := capabilitiesFromOptions(deviceOptions); capabilities != nil {
+				// Path stays /iclock/cdata and PushVersion is empty on this POST,
+				// so the profile scored at handshake time is preserved and only
+				// the capability map is merged in.
+				s.agent.devices.observeProtocol(sn, ProtocolObservation{
+					Path:         r.URL.Path,
+					Capabilities: capabilities,
+				})
+			}
+			log.Printf("[ADMS] Received device options from SN=%s (%d keys)",
+				safeBiometricLogIdentifier(sn), len(deviceOptions))
+			// Options are acked with a bare OK. The count-style "OK:n" ack that
+			// ta_push uses for data tables makes the firmware re-send the whole
+			// option block on every handshake (same failure as tablename=user,
+			// see b78b468).
+			fmt.Fprint(w, "OK")
+			return
 
 		default:
 			log.Printf("[ADMS] Received table=%s from SN=%s (%d bytes)",
@@ -1224,7 +1308,8 @@ func (s *ADMSServer) handlePush(w http.ResponseWriter, r *http.Request) {
 		"ServerVersion=3.1.2\nServerName=ADMS\nPushVersion=3.1.2\n"+
 			"ErrorDelay=30\nRequestDelay=10\nTransInterval=1\n"+
 			"TransTables=User Transaction Facev7 templatev10\n"+
-			"TimeZone=7\nRealTime=1\nTimeoutSec=30",
+			fmt.Sprintf("TimeZone=%d\n", s.agent.config.DeviceTimeZone)+
+			"RealTime=1\nTimeoutSec=30",
 	)
 }
 
@@ -1275,6 +1360,9 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	cmd := queue[0]
 	s.cmdQueue[sn] = queue[1:]
+	// A clock-set is stored as a template; its time is decided now, at
+	// collection, so it is never older than this request.
+	cmd.Command = fillClockCommand(cmd.Command, time.Now(), s.agent.config.DeviceTimeZone)
 	_, deploymentReference := parseBiometricDeploymentReference(cmd.Command)
 	_, deletionReference := parseBiometricDeletionReference(cmd.Command)
 	if (deploymentReference || deletionReference) && cmd.CloudID != "" {
@@ -1318,6 +1406,23 @@ func (s *ADMSServer) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 
 func (s *ADMSServer) enqueueCommand(sn, command string) int {
 	return s.enqueueADMSCommand(sn, command, "", "")
+}
+
+// enqueueCommandUnlessPending queues command only if an identical one is not
+// already waiting for this device. The check and the append share the lock, so
+// two ticks racing cannot both queue.
+func (s *ADMSServer) enqueueCommandUnlessPending(sn, command string) (int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, queued := range s.cmdQueue[sn] {
+		if queued.Command == command {
+			return queued.ID, false
+		}
+	}
+	s.cmdID++
+	id := s.cmdID
+	s.cmdQueue[sn] = append(s.cmdQueue[sn], ADMSCommand{ID: id, Command: command})
+	return id, true
 }
 
 func (s *ADMSServer) enqueueADMSCommand(sn, command, cloudID, label string) int {

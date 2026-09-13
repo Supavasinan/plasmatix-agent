@@ -2126,12 +2126,20 @@ func (a *Agent) handleCommand(requestId, command string, params map[string]strin
 			cmdErr = fmt.Errorf("ADMS server not running")
 		} else {
 			sn := params["deviceSN"]
-			pin := params["pin"]
-			name := params["name"]
-			card := params["card"]
-			cmd := fmt.Sprintf("DATA UPDATE USERINFO PIN=%s\tName=%s\tCard=%s", pin, name, card)
-			id := a.adms.enqueueCommand(sn, cmd)
-			result = map[string]any{"status": "queued", "commandId": id}
+			cmd, buildErr := buildUserInfoCommand(deviceUser{
+				pin:    params["pin"],
+				name:   params["name"],
+				passwd: params["passwd"],
+				card:   params["card"],
+				pri:    params["pri"],
+				verify: params["verify"],
+			})
+			if buildErr != nil {
+				cmdErr = buildErr
+			} else {
+				id := a.adms.enqueueCommand(sn, cmd)
+				result = map[string]any{"status": "queued", "commandId": id}
+			}
 		}
 	case "deleteUser":
 		if a.adms == nil {

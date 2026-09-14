@@ -660,7 +660,7 @@ func (a *Agent) fetchZKBioTimeLastTransactionID(ctx context.Context) (int64, err
 	}
 	req.Header.Set("X-API-Key", a.config.APIKey)
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := cloudHTTPClient(30 * time.Second)
 	res, err := client.Do(req)
 	if err != nil {
 		return 0, err
@@ -709,12 +709,7 @@ func (a *Agent) relayZKBioTimeTransactions(ctx context.Context, txns []map[strin
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-API-Key", a.config.APIKey)
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
+	client := cloudHTTPClient(30 * time.Second)
 	res, err := client.Do(req)
 	if err != nil {
 		return err

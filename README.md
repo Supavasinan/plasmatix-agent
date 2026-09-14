@@ -122,3 +122,29 @@ the CVAccess REST integration continues to work.
 | `migration_read_batch` | Reads one allowlisted, cursor-based source batch |
 | `update` | Downloads new binary, replaces itself, restarts |
 | `uninstall` | Stops service, removes all files, exits |
+
+## Security and release checks
+
+The cloud URL must use HTTPS; HTTP is accepted only for loopback development.
+Use the canonical Plasmatix URL because cross-origin redirects are refused before
+forwarding an API key or attendance data. The BioTime relay now uses the same
+verified TLS client as the command channel. Local CVAccess/BioTime clients still
+accept self-signed certificates for compatibility; keep those connections on a
+trusted device network and provision trusted certificates before removing that
+exception.
+
+ADMS requests are limited to 32 MiB, biometric cdata to 8 MiB, and query replies
+to 8 MiB each. Unfinished query replies have a 32 MiB total budget, a 64-reply
+limit and expire on the next upload after one minute. Slow request headers and
+idle connections have deadlines. ADMS identifies legacy devices by serial number,
+so the listener still belongs on a restricted scanner network.
+
+The obsolete `port` setting is ignored; `adms_port` continues to configure the
+scanner listener. The cloud connection uses outbound polling.
+
+Builds require Go 1.27.1. Pull requests and releases run vet, race tests and
+`govulncheck`; a weekly check catches new advisories. Releases use pinned actions,
+validate VERSION before constructing tags, build all six supported targets and
+publish `checksums.txt`. These checksums help operators verify downloads; the
+self-updater currently relies on the authenticated HTTPS origin and does not
+verify an independent release signature.

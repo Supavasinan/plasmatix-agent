@@ -40,7 +40,6 @@ type Config struct {
 	ZKBioUsername string
 	ZKBioPassword string
 	MigrationDSN  string
-	Port          int
 	Mode          string
 	ADMSPort      int
 	// DeviceTimeZone is the UTC offset in whole hours pushed to scanners in the
@@ -191,6 +190,7 @@ type ADMSServer struct {
 	pendingCmd               map[pendingCommandKey]ADMSCommand
 	cloudCmdID               map[string]struct{}
 	queryBuffers             map[string][]byte
+	queryBufferUpdated       map[string]time.Time
 	captureCmd               map[biometricCaptureKey]pendingBiometricCapture
 	importQuery              map[importQueryKey]pendingBiometricCapture
 	biometricUploadQueue     chan biometricUploadJob
@@ -383,7 +383,6 @@ func loadConfig(path string) (Config, error) {
 		ZKBioUsername string `json:"zkbio_username"`
 		ZKBioPassword string `json:"zkbio_password"`
 		MigrationDSN  string `json:"migration_dsn"`
-		Port          int    `json:"port"`
 		Mode          string `json:"mode"`
 		ADMSPort      int    `json:"adms_port"`
 		// A pointer, because absent and zero mean different things: absent
@@ -412,7 +411,6 @@ func loadConfig(path string) (Config, error) {
 			ZKBioUsername: jc.ZKBioUsername,
 			ZKBioPassword: jc.ZKBioPassword,
 			MigrationDSN:  jc.MigrationDSN,
-			Port:          jc.Port,
 			Mode:          jc.Mode,
 			ADMSPort:      jc.ADMSPort,
 
@@ -437,15 +435,6 @@ func loadConfig(path string) (Config, error) {
 		value := strings.TrimSpace(parts[1])
 		value = strings.Trim(value, `"'`)
 		parsed[key] = value
-	}
-
-	port := 9800
-	if parsed["port"] != "" {
-		parsedPort, err := strconv.Atoi(parsed["port"])
-		if err != nil {
-			return Config{}, fmt.Errorf("invalid port: %w", err)
-		}
-		port = parsedPort
 	}
 
 	deviceTimeZone := defaultDeviceTimeZone
@@ -473,7 +462,6 @@ func loadConfig(path string) (Config, error) {
 		ZKBioUsername: parsed["zkbio_username"],
 		ZKBioPassword: parsed["zkbio_password"],
 		MigrationDSN:  parsed["migration_dsn"],
-		Port:          port,
 		Mode:          parsed["mode"],
 		ADMSPort:      admsPort,
 
@@ -490,9 +478,6 @@ func normalizeConfig(cfg Config) (Config, error) {
 	cfg.ZKBioPassword = strings.TrimSpace(cfg.ZKBioPassword)
 	cfg.MigrationDSN = strings.TrimSpace(cfg.MigrationDSN)
 	cfg.Mode = strings.ToLower(strings.TrimSpace(cfg.Mode))
-	if cfg.Port == 0 {
-		cfg.Port = 9800
-	}
 	if cfg.Mode == "" {
 		cfg.Mode = "zkbio"
 	}
@@ -527,6 +512,9 @@ func normalizeConfig(cfg Config) (Config, error) {
 		return Config{}, errors.New("missing api_key")
 	case cfg.PlamatixURL == "":
 		return Config{}, errors.New("missing plasmatix_url")
+	}
+	if err := validateCloudURL(cfg.PlamatixURL); err != nil {
+		return Config{}, err
 	}
 
 	// zkbio (CVAccess) and zkbiotime (BioTime 8 REST) both reach the server with
@@ -600,11 +588,7 @@ func (a *Agent) startADMSServer() {
 
 	addr := fmt.Sprintf(":%d", a.config.ADMSPort)
 	log.Printf("ADMS server listening on %s", addr)
-	server := &http.Server{
-		Addr:         addr,
-		Handler:      mux,
-		WriteTimeout: secretCommandWriteTimeout,
-	}
+	server := newADMSHTTPServer(addr, mux)
 	if err := server.ListenAndServe(); err != nil {
 		a.adms.shutdownBiometricUploads()
 		a.adms.shutdownBiometricDelivery()
@@ -664,7 +648,7 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 		table := r.URL.Query().Get("table")
 		tableName := r.URL.Query().Get("tablename")
 		accepted := 0
-		bodyReader := io.Reader(r.Body)
+		bodyReader := io.Reader(http.MaxBytesReader(w, r.Body, maxADMSRequestBodyBytes))
 		biometricRequest := isBiometricCDataRequest(table, tableName, r.URL.Query().Get("type"))
 		if biometricRequest {
 			bodyReader = io.LimitReader(r.Body, maxBiometricCDataBodyBytes+1)
@@ -2047,7 +2031,7 @@ func (s *ADMSServer) handleQueryData(w http.ResponseWriter, r *http.Request) {
 		packIdx = 1
 	}
 
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxQueryBufferBytes))
 	if err != nil {
 		log.Printf("[ADMS] querydata read error: SN=%s cmdid=%s err=%v",
 			safeBiometricLogIdentifier(sn), invalidBiometricMetadata, err)
@@ -2072,13 +2056,12 @@ func (s *ADMSServer) handleQueryData(w http.ResponseWriter, r *http.Request) {
 		// the user record and the template table under one cmdid, and mixing
 		// their packs would corrupt both.
 		key := fmt.Sprintf("%s|%s|%s", sn, cmdidStr, strings.ToUpper(tableName))
-		s.mu.Lock()
-		s.queryBuffers[key] = append(s.queryBuffers[key], body...)
-		if finalPack {
-			aggregated = s.queryBuffers[key]
-			delete(s.queryBuffers, key)
+		var accepted bool
+		aggregated, accepted = s.collectQueryPack(key, body, finalPack, time.Now())
+		if !accepted {
+			http.Error(w, "query reply exceeds buffer limit", http.StatusRequestEntityTooLarge)
+			return
 		}
-		s.mu.Unlock()
 	} else if finalPack {
 		aggregated = body
 	}
@@ -2486,15 +2469,6 @@ func (a *Agent) collectSystemInfo() map[string]any {
 	}
 
 	return info
-}
-
-// cloudHTTPClient returns an HTTP client for the Plasmatix cloud control
-// channel. TLS verification is intentionally enabled (Go's default transport):
-// the cloud presents a publicly-trusted certificate, so disabling verification
-// would let an on-path attacker MITM the command channel, steal the API key,
-// and deliver a malicious self-update binary.
-func cloudHTTPClient(timeout time.Duration) *http.Client {
-	return &http.Client{Timeout: timeout}
 }
 
 // releaseAssetName is the filename this host should pull from /api/releases.

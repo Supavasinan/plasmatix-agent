@@ -7,84 +7,93 @@ on:
       - "VERSION"
       - "cmd/**"
       - "go.mod"
-      - ".github/workflows/release.yml"
+      - "go.sum"
+      - ".github/workflows/**"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: agent-release
+  cancel-in-progress: false
 
 jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
   release:
     name: Build & Release
+    needs: checks
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - name: Read version
+      - name: Read and validate version
         id: version
         run: |
-          VERSION=$(tr -d '[:space:]' < VERSION)
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
+          VERSION=$(tr -d '\r\n' < VERSION)
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "VERSION must contain a release semver" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Check if tag exists
-        id: check_tag
+      - name: Check whether the release is already published
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
         run: |
-          if git ls-remote --tags origin "refs/tags/${{ steps.version.outputs.tag }}" | grep -q .; then
-            echo "exists=true" >> $GITHUB_OUTPUT
+          # A failed API request must stop the release, not look like an absent tag.
+          PUBLISHED_TAGS=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+            --jq '.[] | select(.draft == false) | .tag_name')
+          if printf '%s\n' "$PUBLISHED_TAGS" | grep -Fxq -- "$TAG"; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Skip if tag exists
-        if: steps.check_tag.outputs.exists == 'true'
-        run: echo "Tag ${{ steps.version.outputs.tag }} already exists — skipping release"
-
       - name: Set up Go
-        if: steps.check_tag.outputs.exists == 'false'
-        uses: actions/setup-go@v5
+        if: steps.existing.outputs.published == 'false'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.25"
+          go-version-file: go.mod
 
       - name: Build binaries
-        if: steps.check_tag.outputs.exists == 'false'
+        if: steps.existing.outputs.published == 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION="${{ steps.version.outputs.version }}"
           LDFLAGS="-s -w -X main.version=${VERSION}"
           mkdir -p dist
-
-          targets="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64"
-          for target in $targets; do
-            GOOS="${target%/*}"
-            GOARCH="${target#*/}"
-            OUTPUT="dist/plasmatix-agent-${GOOS}-${GOARCH}"
-            # Windows refuses to execute an image without the .exe extension.
-            if [ "${GOOS}" = "windows" ]; then
-              OUTPUT="${OUTPUT}.exe"
-            fi
-            echo "Building ${GOOS}/${GOARCH}..."
-            CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
-              go build -trimpath -ldflags="${LDFLAGS}" -o "${OUTPUT}" ./cmd/plasmatix-agent
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            AGENT_GOOS="${target%/*}"
+            AGENT_GOARCH="${target#*/}"
+            OUTPUT="dist/plasmatix-agent-${AGENT_GOOS}-${AGENT_GOARCH}"
+            if [ "$AGENT_GOOS" = windows ]; then OUTPUT="${OUTPUT}.exe"; fi
+            CGO_ENABLED=0 GOOS="$AGENT_GOOS" GOARCH="$AGENT_GOARCH" \
+              go build -trimpath -ldflags="$LDFLAGS" -o "$OUTPUT" ./cmd/plasmatix-agent
           done
-
-          echo "${VERSION}" > dist/version.txt
-          ls -lh dist/
-
-      - name: Create tag
-        if: steps.check_tag.outputs.exists == 'false'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
-          git push origin "${{ steps.version.outputs.tag }}"
+          echo "$VERSION" > dist/version.txt
+          (cd dist && sha256sum plasmatix-agent-* > checksums.txt)
 
       - name: Create GitHub Release
-        if: steps.check_tag.outputs.exists == 'false'
-        uses: softprops/action-gh-release@v2
+        if: steps.existing.outputs.published == 'false'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             dist/plasmatix-agent-*
             dist/version.txt
+            dist/checksums.txt

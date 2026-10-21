@@ -671,37 +671,21 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 
 		switch table {
 		case "ATTLOG":
-			received := 0
-			for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
-				line = strings.TrimSpace(line)
-				if line == "" {
-					continue
-				}
-				fields := strings.Split(line, "\t")
-				if len(fields) < 5 {
-					log.Printf("[ADMS] Invalid ATTLOG line: %s", line)
-					continue
-				}
-
-				status, _ := strconv.Atoi(strings.TrimSpace(fields[2]))
-				verifyMode, _ := strconv.Atoi(strings.TrimSpace(fields[3]))
-				workCode, _ := strconv.Atoi(strings.TrimSpace(fields[4]))
-
-				received++
-				s.relayAttendance(ADMSAttendance{
-					UserID:     strings.TrimSpace(fields[0]),
-					PunchTime:  strings.TrimSpace(fields[1]),
-					Status:     status,
-					VerifyMode: verifyMode,
-					WorkCode:   workCode,
-					DeviceSN:   sn,
-				})
+			rows := parseATTLOGRows(sn, body)
+			log.Printf("[ADMS] Received ATTLOG from SN=%s (%d rows)", sn, len(rows))
+			// The scanner forgets a punch once it is told "OK", so it is told
+			// only after Plasmatix has stored every row. Anything else keeps the
+			// punches on the scanner, which uploads them again later.
+			if err := s.saveAttendance(rows); err != nil {
+				log.Printf("[ADMS] ATTLOG not saved, scanner will resend: SN=%s rows=%d err=%v",
+					sn, len(rows), err)
+				http.Error(w, "attendance not saved", http.StatusServiceUnavailable)
+				return
 			}
-			log.Printf("[ADMS] Received ATTLOG from SN=%s (%d rows)", sn, received)
-			accepted = received
+			accepted = len(rows)
 
 		case "rtlog":
-			received := 0
+			var received []ADMSRtlog
 			for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
 				line = strings.TrimSpace(line)
 				if line == "" {
@@ -719,11 +703,17 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 					VerifyType:  atoiOrZero(fields["verifytype"]),
 					Index:       atoiOrZero(fields["index"]),
 				}
-				received++
-				s.relayRtlog(rt)
+				received = append(received, rt)
 			}
-			log.Printf("[ADMS] Received rtlog from SN=%s (%d rows)", sn, received)
-			accepted = received
+			log.Printf("[ADMS] Received rtlog from SN=%s (%d rows)", sn, len(received))
+			// Same rule as ATTLOG: "OK" only once Plasmatix has every row.
+			if err := s.saveRtlog(received); err != nil {
+				log.Printf("[ADMS] rtlog not saved, device will resend: SN=%s rows=%d err=%v",
+					sn, len(received), err)
+				http.Error(w, "rtlog not saved", http.StatusServiceUnavailable)
+				return
+			}
+			accepted = len(received)
 
 		case "tabledata":
 			received := countADMSRows(body)
@@ -1197,88 +1187,6 @@ func firstField(fields map[string]string, keys ...string) string {
 func atoiOrZero(s string) int {
 	n, _ := strconv.Atoi(strings.TrimSpace(s))
 	return n
-}
-
-func (s *ADMSServer) relayAttendance(att ADMSAttendance) {
-	go func() {
-		payload := map[string]any{
-			"type": "attlog",
-			"data": att,
-		}
-		body, err := json.Marshal(payload)
-		if err != nil {
-			log.Printf("[ADMS] Marshal attlog error: %v", err)
-			return
-		}
-
-		attURL := fmt.Sprintf("%s/api/agent-bridge/attlog", s.agent.config.PlamatixURL)
-		req, err := http.NewRequest(http.MethodPost, attURL, strings.NewReader(string(body)))
-		if err != nil {
-			log.Printf("[ADMS] Create attlog request error: %v", err)
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-API-Key", s.agent.config.APIKey)
-
-		client := cloudHTTPClient(10 * time.Second)
-
-		res, err := client.Do(req)
-		if err != nil {
-			log.Printf("[ADMS] Post attlog error: %v", err)
-			return
-		}
-		defer res.Body.Close()
-
-		if res.StatusCode != http.StatusOK {
-			respBody, _ := io.ReadAll(res.Body)
-			log.Printf("[ADMS] Post attlog failed (HTTP %d): %s", res.StatusCode, string(respBody))
-			return
-		}
-
-		log.Printf("[ADMS] Relayed ATTLOG: SN=%s UserID=%s PunchTime=%s",
-			att.DeviceSN, att.UserID, att.PunchTime)
-	}()
-}
-
-func (s *ADMSServer) relayRtlog(rt ADMSRtlog) {
-	go func() {
-		payload := map[string]any{
-			"type": "rtlog",
-			"data": rt,
-		}
-		body, err := json.Marshal(payload)
-		if err != nil {
-			log.Printf("[ADMS] Marshal rtlog error: %v", err)
-			return
-		}
-
-		attURL := fmt.Sprintf("%s/api/agent-bridge/attlog", s.agent.config.PlamatixURL)
-		req, err := http.NewRequest(http.MethodPost, attURL, strings.NewReader(string(body)))
-		if err != nil {
-			log.Printf("[ADMS] Create rtlog request error: %v", err)
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-API-Key", s.agent.config.APIKey)
-
-		client := cloudHTTPClient(10 * time.Second)
-
-		res, err := client.Do(req)
-		if err != nil {
-			log.Printf("[ADMS] Post rtlog error: %v", err)
-			return
-		}
-		defer res.Body.Close()
-
-		if res.StatusCode != http.StatusOK {
-			respBody, _ := io.ReadAll(res.Body)
-			log.Printf("[ADMS] Post rtlog failed (HTTP %d): %s", res.StatusCode, string(respBody))
-			return
-		}
-
-		log.Printf("[ADMS] Relayed rtlog: SN=%s pin=%s time=%s event=%d verify=%d index=%d",
-			rt.DeviceSN, rt.Pin, rt.Time, rt.Event, rt.VerifyType, rt.Index)
-	}()
 }
 
 func (s *ADMSServer) fetchDeviceState(sn string) (deviceSyncState, error) {
@@ -2064,6 +1972,20 @@ func (s *ADMSServer) handleQueryData(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if finalPack {
 		aggregated = body
+	}
+
+	if finalPack && strings.EqualFold(strings.TrimSpace(tableName), "ATTLOG") {
+		// The answer to a DATA QUERY ATTLOG (Plasmatix's backfill of a day it
+		// is short of). Stored like a live upload; if storing fails the reply
+		// is still acked, because Plasmatix asks for the same day again later.
+		rows := parseATTLOGRows(sn, aggregated)
+		if err := s.saveAttendance(rows); err != nil {
+			log.Printf("[ADMS] Queried ATTLOG not saved: SN=%s cmdid=%s rows=%d err=%v",
+				safeBiometricLogIdentifier(sn), cmdIDLog, len(rows), err)
+		} else {
+			log.Printf("[ADMS] Queried ATTLOG saved: SN=%s cmdid=%s rows=%d",
+				safeBiometricLogIdentifier(sn), cmdIDLog, len(rows))
+		}
 	}
 
 	if finalPack && isBiometricTemplateTable(tableName) {

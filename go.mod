@@ -1,6 +1,6 @@
 module github.com/Supavasinan/plasmatix-agent
 
-go 1.27.1
+go 1.27.3
 
 require (
 	github.com/Supavasinan/zkbiotime-go v0.1.5

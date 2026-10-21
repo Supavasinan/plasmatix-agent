@@ -142,7 +142,7 @@ so the listener still belongs on a restricted scanner network.
 The obsolete `port` setting is ignored; `adms_port` continues to configure the
 scanner listener. The cloud connection uses outbound polling.
 
-Builds require Go 1.27.1. Pull requests and releases run vet, race tests and
+Builds require Go 1.27.3. Pull requests and releases run vet, race tests and
 `govulncheck`; a weekly check catches new advisories. Releases use pinned actions,
 validate VERSION before constructing tags, build all six supported targets and
 publish `checksums.txt`. These checksums help operators verify downloads; the

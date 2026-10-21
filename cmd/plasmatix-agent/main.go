@@ -685,7 +685,7 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 			accepted = len(rows)
 
 		case "rtlog":
-			received := 0
+			var received []ADMSRtlog
 			for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
 				line = strings.TrimSpace(line)
 				if line == "" {
@@ -703,11 +703,17 @@ func (s *ADMSServer) handleCData(w http.ResponseWriter, r *http.Request) {
 					VerifyType:  atoiOrZero(fields["verifytype"]),
 					Index:       atoiOrZero(fields["index"]),
 				}
-				received++
-				s.relayRtlog(rt)
+				received = append(received, rt)
 			}
-			log.Printf("[ADMS] Received rtlog from SN=%s (%d rows)", sn, received)
-			accepted = received
+			log.Printf("[ADMS] Received rtlog from SN=%s (%d rows)", sn, len(received))
+			// Same rule as ATTLOG: "OK" only once Plasmatix has every row.
+			if err := s.saveRtlog(received); err != nil {
+				log.Printf("[ADMS] rtlog not saved, device will resend: SN=%s rows=%d err=%v",
+					sn, len(received), err)
+				http.Error(w, "rtlog not saved", http.StatusServiceUnavailable)
+				return
+			}
+			accepted = len(received)
 
 		case "tabledata":
 			received := countADMSRows(body)
@@ -1181,47 +1187,6 @@ func firstField(fields map[string]string, keys ...string) string {
 func atoiOrZero(s string) int {
 	n, _ := strconv.Atoi(strings.TrimSpace(s))
 	return n
-}
-
-func (s *ADMSServer) relayRtlog(rt ADMSRtlog) {
-	go func() {
-		payload := map[string]any{
-			"type": "rtlog",
-			"data": rt,
-		}
-		body, err := json.Marshal(payload)
-		if err != nil {
-			log.Printf("[ADMS] Marshal rtlog error: %v", err)
-			return
-		}
-
-		attURL := fmt.Sprintf("%s/api/agent-bridge/attlog", s.agent.config.PlamatixURL)
-		req, err := http.NewRequest(http.MethodPost, attURL, strings.NewReader(string(body)))
-		if err != nil {
-			log.Printf("[ADMS] Create rtlog request error: %v", err)
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-API-Key", s.agent.config.APIKey)
-
-		client := cloudHTTPClient(10 * time.Second)
-
-		res, err := client.Do(req)
-		if err != nil {
-			log.Printf("[ADMS] Post rtlog error: %v", err)
-			return
-		}
-		defer res.Body.Close()
-
-		if res.StatusCode != http.StatusOK {
-			respBody, _ := io.ReadAll(res.Body)
-			log.Printf("[ADMS] Post rtlog failed (HTTP %d): %s", res.StatusCode, string(respBody))
-			return
-		}
-
-		log.Printf("[ADMS] Relayed rtlog: SN=%s pin=%s time=%s event=%d verify=%d index=%d",
-			rt.DeviceSN, rt.Pin, rt.Time, rt.Event, rt.VerifyType, rt.Index)
-	}()
 }
 
 func (s *ADMSServer) fetchDeviceState(sn string) (deviceSyncState, error) {

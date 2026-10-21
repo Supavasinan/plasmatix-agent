@@ -158,3 +158,35 @@ func TestParseATTLOGRowsDropsUnstorableLines(t *testing.T) {
 		t.Fatalf("rows = %+v", rows)
 	}
 }
+
+func postRtlog(server *ADMSServer, sn, body string) *httptest.ResponseRecorder {
+	request := httptest.NewRequest(http.MethodPost, "/iclock/cdata?SN="+sn+"&table=rtlog", strings.NewReader(body))
+	recorder := httptest.NewRecorder()
+	server.handleCData(recorder, request)
+	return recorder
+}
+
+const oneRtlog = "time=2026-10-16 07:58:01\tpin=7\tcardno=0\teventaddr=1\tevent=0\tinoutstatus=0\tverifytype=15\tindex=3\n"
+
+func TestRtlogIsAckedOnlyAfterPlasmatixStoresIt(t *testing.T) {
+	cloud, server := newAttlogCloud(t, func(map[string]any) (int, string) { return http.StatusOK, `{"ok":true}` })
+
+	recorder := postRtlog(&ADMSServer{agent: &Agent{config: Config{PlamatixURL: server.URL}, devices: newDeviceTracker()}}, "AC1", oneRtlog)
+
+	if recorder.Code != http.StatusOK || !strings.HasPrefix(recorder.Body.String(), "OK") {
+		t.Fatalf("ack = %d %q", recorder.Code, recorder.Body.String())
+	}
+	if len(cloud.payloads) != 1 || cloud.payloads[0]["type"] != "rtlog" {
+		t.Fatalf("payloads = %v", cloud.payloads)
+	}
+}
+
+func TestRtlogIsNotAckedWhenPlasmatixFails(t *testing.T) {
+	_, server := newAttlogCloud(t, func(map[string]any) (int, string) { return http.StatusBadGateway, `` })
+
+	recorder := postRtlog(&ADMSServer{agent: &Agent{config: Config{PlamatixURL: server.URL}, devices: newDeviceTracker()}}, "AC1", oneRtlog)
+
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d; want 503", recorder.Code)
+	}
+}

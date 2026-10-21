@@ -97,6 +97,19 @@ func (s *ADMSServer) saveAttendance(rows []ADMSAttendance) error {
 	return nil
 }
 
+// saveRtlog stores access-control events one per request — Plasmatix has no
+// batch form for them, and an upload is usually a single realtime event — and
+// returns nil only when each was answered 200, which that path sends after
+// the insert.
+func (s *ADMSServer) saveRtlog(rows []ADMSRtlog) error {
+	for _, row := range rows {
+		if _, err := s.postAttlog(map[string]any{"type": "rtlog", "data": row}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 type attlogBatchReply struct {
 	OK       bool   `json:"ok"`
 	Received *int   `json:"received"`

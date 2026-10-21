@@ -79,7 +79,8 @@ func TestHandleCData_AttPhotoAckedWithOK(t *testing.T) {
 
 func TestHandleCDataTAPushAttendanceReturnsAcceptedCount(t *testing.T) {
 	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true,"received":1,"inserted":1,"skipped":0}`))
 	}))
 	defer cloud.Close()
 
